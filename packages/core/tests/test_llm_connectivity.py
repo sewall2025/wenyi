@@ -21,6 +21,8 @@ from wenyi_core.llm.connectivity import (
 from wenyi_core.llm.providers._openai_compatible import OpenAICompatibleBaseClient
 from wenyi_core.llm.router import RoutedLLMClient
 
+from tests.model_fixtures import streamed
+
 SECRET = "fake-probe-secret-not-a-real-key"
 _NO_THINKING = {"thinking": False}
 
@@ -79,7 +81,7 @@ def sdk(monkeypatch):
         behavior = behaviors.get(kwargs["model"], _response())
         if isinstance(behavior, Exception):
             raise behavior
-        return behavior
+        return streamed(behavior, kwargs)
 
     def ensure(self):
         clients.append({"timeout": self.cfg.timeout, "max_retries": self.cfg.max_retries})

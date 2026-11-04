@@ -36,6 +36,13 @@ class EmptyResponseError(WenyiError, RuntimeError):
     retryable: ClassVar[bool] = True
 
 
+class IncompleteStreamError(WenyiError, RuntimeError):
+    """A streamed response ended without a finish reason; its partial text is discarded."""
+
+    code: ClassVar[str] = "llm_incomplete_stream"
+    retryable: ClassVar[bool] = True
+
+
 class TruncatedResponseError(WenyiError, RuntimeError):
     """The provider stopped generation at its output token limit."""
 
@@ -201,6 +208,8 @@ def retry_reason(error: Any, *, operation: str | None = None) -> str | None:
         return "truncated_response" if operation in {"synopsis.chapter", "synopsis.book"} else None
     if any(isinstance(item, EmptyResponseError) for item in chain):
         return "empty_response"
+    if any(isinstance(item, IncompleteStreamError) for item in chain):
+        return "incomplete_stream"
 
     permanent_types = (
         httpx.InvalidURL,
@@ -406,6 +415,7 @@ def provider_retry(max_retries: int, reporter: RetryReporter, *, sleep=None):
 
 __all__ = [
     "EmptyResponseError",
+    "IncompleteStreamError",
     "ProviderRequestError",
     "RetryReporter",
     "TruncatedResponseError",

@@ -85,7 +85,8 @@ def model_route(
         "adapter_protocol": adapter.protocol_version,
         "options": options.model_dump(mode="json"),
         "max_output_tokens": limit,
-        "connection_options": connection_options.model_dump(mode="json"),
+        # Transport-only switches such as ``stream`` do not change output or resume identity.
+        "connection_options": connection_options.model_dump(mode="json", exclude={"stream"}),
     }
     return ResolvedRoute(
         operation,

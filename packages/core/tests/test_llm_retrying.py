@@ -26,7 +26,7 @@ from wenyi_core.llm.router import RoutedLLMClient
 from wenyi_core.pipeline.orchestrator import Orchestrator
 from wenyi_core.storage.file import FileStorage
 
-from tests.model_fixtures import model_config
+from tests.model_fixtures import model_config, streamed
 
 
 class _HttpError(Exception):
@@ -53,12 +53,11 @@ class _CompletionsStub:
         self.calls = 0
 
     def create(self, **kwargs: Any) -> Any:
-        del kwargs
         self.calls += 1
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
-        return outcome
+        return streamed(outcome, kwargs)
 
 
 class _ClientStub:

@@ -9,6 +9,7 @@ from typing import Any
 from .json_parser import JsonParseError
 from .retrying import (
     EmptyResponseError,
+    IncompleteStreamError,
     TruncatedResponseError,
     error_status_code,
     retry_reason,
@@ -52,6 +53,11 @@ _HTTP_FAILURES = {
 _RESPONSE_FAILURES = (
     (TruncatedResponseError, "truncated_response", "The provider response was truncated."),
     (EmptyResponseError, "empty_response", "The provider returned no usable text."),
+    (
+        IncompleteStreamError,
+        "incomplete_stream",
+        "The provider stream ended before the response finished.",
+    ),
     (JsonParseError, "invalid_json", "The provider response was not valid JSON."),
     (json.JSONDecodeError, "invalid_json", "The provider response was not valid JSON."),
 )

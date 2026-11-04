@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from tests.model_fixtures import streamed
 from wenyi_backend.context import use_context
 from wenyi_core.config import Config
 from wenyi_core.llm.configuration import ProviderConfig
@@ -611,7 +612,10 @@ def test_global_connectivity_test_uses_saved_manual_key_without_echo(desktop_con
     def ensure(self):
         used.append(self.api_key())
         reply = SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content="OK"))
-        create = lambda **kwargs: SimpleNamespace(usage=None, choices=[reply])  # noqa: E731
+
+        def create(**kwargs):
+            return streamed(SimpleNamespace(usage=None, choices=[reply]), kwargs)
+
         return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
 
     monkeypatch.setattr(OpenAICompatibleBaseClient, "_ensure_client", ensure)

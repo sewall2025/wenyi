@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..transport import Messages, ResolvedModel
 from ._openai_compatible import (
     OpenAICompatibleBaseClient,
+    OpenAIConnectionOptions,
     base_request_kwargs,
     deep_merge,
 )
@@ -16,8 +17,7 @@ from ._openai_compatible import (
 ReasoningStyle = Literal["none", "deepseek", "openai", "openrouter"]
 
 
-class CompatibleConnectionOptions(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+class CompatibleConnectionOptions(OpenAIConnectionOptions):
     reasoning_style: ReasoningStyle = "none"
 
 

@@ -38,7 +38,7 @@ from wenyi_core.storage.file import FileStorage
 from wenyi_core.storage.run_store import source_sha256
 
 from tests.fake_llm import routing_handler
-from tests.model_fixtures import model_config
+from tests.model_fixtures import model_config, streamed
 from tests.sample_data import write_sample_txt
 
 
@@ -84,7 +84,7 @@ class _CompletionsStub:
             raise AssertionError("stub 响应已耗尽")
         resp = self._responses[self._idx]
         self._idx += 1
-        return resp
+        return streamed(resp, kwargs)
 
 
 class _ChatStub:

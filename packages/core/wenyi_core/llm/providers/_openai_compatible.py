@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import json
 from abc import abstractmethod
+from types import SimpleNamespace
 from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel
 
-from ..retrying import EmptyResponseError, TruncatedResponseError
-from ..transport import Messages, ProviderAdapter, RequestContext, ResolvedModel
+from ..retrying import EmptyResponseError, IncompleteStreamError, TruncatedResponseError
+from ..transport import (
+    ConnectionOptions,
+    Messages,
+    ProviderAdapter,
+    RequestContext,
+    ResolvedModel,
+)
 from ..usage import (
     UsageSample,
     make_usage_sample,
@@ -117,8 +124,51 @@ def normalize_openai_usage(usage: Any, *, separate_cache_writes: bool = True) ->
     )
 
 
+def _read_stream(stream: Any) -> tuple[Any, Any, Any]:
+    """Join one complete streamed completion into ``(message, finish_reason, usage)``.
+
+    A stream that ends without a finish reason was cut off; its partial text and usage are
+    discarded so the shared retry policy can request a complete answer.
+    """
+    content: list[str] = []
+    reasoning: list[str] = []
+    finish_reason = None
+    usage = None
+    with stream:
+        for chunk in stream:
+            usage = getattr(chunk, "usage", None) or usage
+            for choice in getattr(chunk, "choices", None) or []:
+                finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+                delta = getattr(choice, "delta", None)
+                text = getattr(delta, "content", None)
+                if isinstance(text, str):
+                    content.append(text)
+                text = getattr(delta, "reasoning_content", None)
+                if isinstance(text, str):
+                    reasoning.append(text)
+    if finish_reason is None:
+        raise IncompleteStreamError("OpenAI-compatible stream ended without a finish reason")
+    message = SimpleNamespace(
+        content="".join(content), reasoning_content="".join(reasoning) if reasoning else None
+    )
+    return message, finish_reason, usage
+
+
+class OpenAIConnectionOptions(ConnectionOptions):
+    """Chat Completions transport choices shared by every OpenAI-compatible connection."""
+
+    # Streaming keeps gateways from closing long idle requests; it never changes model output.
+    stream: bool = True
+
+
 class OpenAICompatibleBaseClient(ProviderAdapter, Generic[OptionsT]):
     """Reuse one SDK connection; route selection and usage belong to the caller."""
+
+    connection_options: type[OpenAIConnectionOptions] = OpenAIConnectionOptions
+
+    @property
+    def stream(self) -> bool:
+        return self.connection_options.model_validate(self.cfg.model_extra or {}).stream
 
     def _ensure_client(self) -> Any:
         with self._client_lock:
@@ -181,14 +231,21 @@ class OpenAICompatibleBaseClient(ProviderAdapter, Generic[OptionsT]):
         kwargs = self._build_request_kwargs(
             model, messages, json_mode=json_mode, max_tokens=context.max_tokens
         )
-        response = self._ensure_client().chat.completions.create(**kwargs)
-        context.record_usage(self._normalize_usage(getattr(response, "usage", None)))
-        choice = response.choices[0]
-        message = choice.message
+        completions = self._ensure_client().chat.completions
+        if self.stream:
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
+            message, finish_reason, usage = _read_stream(completions.create(**kwargs))
+        else:
+            response = completions.create(**kwargs)
+            usage = getattr(response, "usage", None)
+            choice = response.choices[0]
+            message = choice.message
+            finish_reason = getattr(choice, "finish_reason", "")
+        context.record_usage(self._normalize_usage(usage))
         raw_content = getattr(message, "content", None)
         content = raw_content if isinstance(raw_content, str) else ""
-        finish_reason = str(getattr(choice, "finish_reason", "")).lower()
-        if finish_reason == "length":
+        if str(finish_reason).lower() == "length":
             # Truncated output is not a complete answer; never treat a mid-sentence cut as success.
             raise TruncatedResponseError(
                 "OpenAI-compatible response was truncated at the token limit"

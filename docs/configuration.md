@@ -167,7 +167,9 @@ Replace `YOUR_EDITOR_MODEL` with a model supported by your endpoint. Other opera
 
 Compatible endpoints accept `reasoning_style: none` (default), `deepseek`, `openai`, or `openrouter`. `json_response_fallback: reasoning_content` is an explicit option for gateways placing JSON there; the default is `none`, and non-JSON reasoning is never accepted. Gemini thinking level and thinking budget are mutually exclusive. Raw extension dictionaries are endpoint-specific; offline validation cannot prove a remote model supports them.
 
-Provider SDK retries are disabled. Wenyi retries transient connections/timeouts, HTTP 408/409/429 and 5xx responses, and empty responses through one shared policy. Retry backoff releases the connection permit and responds to cancellation. Ordinary 4xx errors are not retried. PDF's default MinerU import uses a separate `MINERU_API_KEY`; the optional BabelDOC HTTP bridge is independent of model routing.
+Every OpenAI-compatible connection (all kinds except `gemini` and `fake`) accepts `stream: true` (default) or `stream: false`. Streaming requests usage in the final chunk with `stream_options.include_usage`, so gateways do not drop long requests as idle. With streaming, `timeout` limits the wait between chunks, not the whole request; use `budget.deadline_seconds` to bound total run time. Set `stream: false` for older gateways that reject `stream_options`. The switch does not change model output or resume identity.
+
+Provider SDK retries are disabled. Wenyi retries transient connections/timeouts, HTTP 408/409/429 and 5xx responses, empty responses, and streams that end without a finish reason through one shared policy; partial streamed text is discarded. Retry backoff releases the connection permit and responds to cancellation. Ordinary 4xx errors are not retried. PDF's default MinerU import uses a separate `MINERU_API_KEY`; the optional BabelDOC HTTP bridge is independent of model routing.
 
 The global **MinerU PDF parsing** settings card is separate from model connections.
 Web and CLI use `MINERU_API_KEY` from the deployment/process environment. Desktop checks

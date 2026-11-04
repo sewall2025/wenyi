@@ -17,6 +17,8 @@ from wenyi_core.llm.retrying import (
 )
 from wenyi_core.llm.router import RoutedLLMClient
 
+from tests.model_fixtures import streamed
+
 SECRET = "fake-boundary-secret-not-a-real-key"
 
 
@@ -180,9 +182,10 @@ def test_fallback_still_sees_original_provider_classification():
 
     def create(**kwargs):
         assert kwargs["messages"] == messages
-        return SimpleNamespace(
+        response = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=SECRET), finish_reason="stop")]
         )
+        return streamed(response, kwargs)
 
     routed.adapter("other")._client = SimpleNamespace(
         chat=SimpleNamespace(completions=SimpleNamespace(create=create))

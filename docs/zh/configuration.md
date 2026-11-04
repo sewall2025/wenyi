@@ -153,7 +153,9 @@ llm:
 
 兼容端点的 `reasoning_style` 支持 `none`（默认）、`deepseek`、`openai`、`openrouter`。只有明确配置 `json_response_fallback: reasoning_content`，才会从网关的该字段读取有效 JSON；默认 `none`，非 JSON 推理文本不会被当作结果。Gemini 的 thinking level 和 budget 互斥。原始扩展字典依赖具体端点；离线校验无法保证远端模型接受这些参数。
 
-SDK 内置重试统一关闭。Wenyi 统一重试连接/超时、HTTP 408/409/429、5xx 瞬时错误及空响应；退避期间释放连接并发名额，并响应取消。普通 4xx 错误不重试。PDF 默认 MinerU 解析另用 `MINERU_API_KEY`；可选 BabelDOC HTTP bridge 独立于模型路由。
+所有 OpenAI 兼容连接（除 `gemini` 和 `fake` 外的适配器）都接受 `stream: true`（默认）或 `stream: false`。流式请求通过 `stream_options.include_usage` 在最后一个分块获取用量，避免网关把长时间请求当作空闲连接断开。流式下 `timeout` 表示两个分块之间的最长等待时间，而不是整次请求的总时长；总时长用 `budget.deadline_seconds` 限制。不支持 `stream_options` 的旧网关可设 `stream: false`。该开关不影响模型输出，也不改变续跑身份。
+
+SDK 内置重试统一关闭。Wenyi 统一重试连接/超时、HTTP 408/409/429、5xx 瞬时错误、空响应及未收到结束标记的流式响应（部分内容丢弃）；退避期间释放连接并发名额，并响应取消。普通 4xx 错误不重试。PDF 默认 MinerU 解析另用 `MINERU_API_KEY`；可选 BabelDOC HTTP bridge 独立于模型路由。
 
 总设置中的 **MinerU PDF 解析**卡片独立于模型连接。Web 和 CLI 从部署/进程环境变量
 `MINERU_API_KEY` 读取密钥。Desktop 优先读取同一变量，缺失时使用该卡片手动保存的

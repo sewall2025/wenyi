@@ -14,6 +14,8 @@ from wenyi_core.llm.router import RoutedLLMClient
 from wenyi_core.llm.routing import inference_snapshot, resolve_routes
 from wenyi_core.llm.usage import UsageSample
 
+from tests.model_fixtures import streamed
+
 
 def _graph(**extra):
     return LLMConfig.model_validate(
@@ -157,9 +159,12 @@ def test_native_and_compatible_adapters_can_run_together():
 
     def compatible(**kwargs):
         requests["compatible"] = kwargs
-        return NS(
-            choices=[NS(message=NS(content="translation"))],
-            usage=NS(prompt_tokens=7, completion_tokens=3, total_tokens=10),
+        return streamed(
+            NS(
+                choices=[NS(message=NS(content="translation"))],
+                usage=NS(prompt_tokens=7, completion_tokens=3, total_tokens=10),
+            ),
+            kwargs,
         )
 
     def native(**kwargs):
@@ -353,11 +358,12 @@ def test_workflow_wire_limits_match_profile_or_provider_defaults(kind, explicit)
 
     def request(**kwargs):
         requests.append(kwargs)
-        return SimpleNamespace(
+        response = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="ok"), finish_reason="stop")],
             text="ok",
             candidates=[SimpleNamespace(finish_reason="STOP")],
         )
+        return streamed(response, kwargs)
 
     client.adapter("remote")._client = SimpleNamespace(
         chat=SimpleNamespace(completions=SimpleNamespace(create=request)),

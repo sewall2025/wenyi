@@ -12,14 +12,17 @@ from wenyi_core.llm.retrying import TruncatedResponseError
 from wenyi_core.llm.router import RoutedLLMClient
 from wenyi_core.models.glossary import GlossaryTerm
 
+from tests.model_fixtures import FakeStream, stream_chunks
+
 
 def response(content, finish_reason="stop"):
-    return SimpleNamespace(
+    completion = SimpleNamespace(
         choices=[
             SimpleNamespace(message=SimpleNamespace(content=content), finish_reason=finish_reason)
         ],
         usage=SimpleNamespace(prompt_tokens=7, completion_tokens=3, total_tokens=10),
     )
+    return FakeStream(stream_chunks(completion))
 
 
 def mocked_client(monkeypatch, *, kind="deepseek", explicit=None, retries=1):
