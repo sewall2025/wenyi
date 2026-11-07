@@ -11,12 +11,33 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
+from ..ingest.tokens import count_tokens
 from .json_parser import parse_json_loose
 from .usage import UsageTracker
 
 Messages = list[dict[str, str]]
 EventSink = Callable[..., None]
 _LOGGER = logging.getLogger(__name__)
+
+# ponytail: reserve when the route has no max_output_tokens; CJK output can exceed three
+# cl100k tokens per source token and hidden reasoning tokens are not covered. Configure
+# max_output_tokens for an exact reserve.
+_OUTPUT_TOKENS_PER_SOURCE_TOKEN = 3
+# Role and separator tokens added by chat templates per message (approximate).
+_MESSAGE_OVERHEAD_TOKENS = 4
+# ponytail: fixed 5% headroom over the calibrated estimate for tokenizer drift between
+# requests; a provider-side token-count endpoint would replace it.
+_WINDOW_SAFETY_MARGIN = 0.05
+# ponytail: the reported/estimated ratio only grows and is capped, so one odd usage report
+# (cached or multimodal accounting) cannot shrink every later request below a few segments.
+_MAX_PROMPT_RATIO = 2.0
+# Tiny prompts are dominated by chat-template overhead and would skew the ratio.
+_MIN_CALIBRATION_TOKENS = 256
+
+
+def estimate_prompt_tokens(messages: Messages) -> int:
+    """Return the local cl100k estimate of a chat prompt."""
+    return sum(count_tokens(message["content"]) + _MESSAGE_OVERHEAD_TOKENS for message in messages)
 
 
 class LLMClient(ABC):
@@ -31,6 +52,12 @@ class LLMClient(ABC):
         self._event_observer: ContextVar[EventSink | None] = ContextVar(
             "llm_event_observer", default=None
         )
+        # ponytail: learned windows are per operation (one primary route per client) and live
+        # only for this process; configure the model's context_window to persist them.
+        self._learned_windows: dict[str, int] = {}
+        # Reported prompt tokens per local estimate token, per operation, same lifetime.
+        self._prompt_ratios: dict[str, float] = {}
+        self._learned_windows_lock = threading.Lock()
 
     def set_event_sink(self, sink: EventSink | None) -> None:
         """Bind the run event sink so the pipeline can append retry events to the book log."""
@@ -89,6 +116,56 @@ class LLMClient(ABC):
         """Return cumulative token usage with totals, tiers and cache hit rates."""
         return self.usage.summary()
 
+    def context_window(self, operation: str) -> int | None:
+        """Return the prompt plus output token limit known for this operation's route."""
+        with self._learned_windows_lock:
+            return self._learned_windows.get(operation)
+
+    def learn_context_window(self, operation: str, total_tokens: int) -> None:
+        """Remember a reported context limit (or a truncated reply's total) for this run."""
+        if total_tokens <= 0:
+            return
+        with self._learned_windows_lock:
+            known = self._learned_windows.get(operation)
+            self._learned_windows[operation] = min(known or total_tokens, total_tokens)
+
+    def calibrate_prompt_tokens(self, operation: str, messages: Messages, reported: int) -> None:
+        """Raise the operation's estimate ratio when the provider counted more than cl100k."""
+        estimated = estimate_prompt_tokens(messages)
+        if reported <= 0 or estimated < _MIN_CALIBRATION_TOKENS:
+            return
+        ratio = min(reported / estimated, _MAX_PROMPT_RATIO)
+        with self._learned_windows_lock:
+            if ratio > self._prompt_ratios.get(operation, 1.0):
+                self._prompt_ratios[operation] = ratio
+
+    def fits_context_window(
+        self, operation: str, messages: Messages, *, source_tokens: int
+    ) -> bool:
+        """Estimate prompt plus reserved output locally; unknown windows always fit."""
+        window = self.context_window(operation)
+        if window is None:
+            return True
+        with self._learned_windows_lock:
+            ratio = self._prompt_ratios.get(operation, 1.0)
+        reserve = (
+            self.max_output_tokens(operation) or _OUTPUT_TOKENS_PER_SOURCE_TOKEN * source_tokens
+        )
+        prompt = estimate_prompt_tokens(messages) * ratio
+        return (prompt + reserve) * (1 + _WINDOW_SAFETY_MARGIN) <= window
+
+    def emit_event(self, event: str, **data: Any) -> None:
+        """Append a workflow diagnostic to the bound run event sink, when any."""
+        self._emit_event(event, **data)
+
+    def max_output_tokens(self, operation: str) -> int | None:
+        """Return the configured output limit for this operation's route, when known."""
+        return None
+
+    def batch_output(self, operation: str) -> bool:
+        """Return False when the route's model takes one plain-text paragraph per request."""
+        return True
+
     def request_snapshot(self, operation: str) -> dict[str, Any] | None:
         """Return authoritative replay metadata when supported, never an inferred route."""
         return None
@@ -131,8 +208,13 @@ class LLMClient(ABC):
         operation: str,
         json_mode: bool = False,
         max_tokens: int | None = None,
+        json_schema: dict[str, Any] | None = None,
     ) -> str:
-        """Return model text using the registered operation route."""
+        """Return model text using the registered operation route.
+
+        ``json_schema`` is an optional hint for providers configured for strict structured
+        output; callers must still validate the reply locally.
+        """
         raise NotImplementedError
 
     def complete_json(

@@ -9,6 +9,7 @@ from dataclasses import asdict
 from typing import Any
 
 from ...agents.precision import PrecisionAgent, PrecisionError, PrecisionInputs
+from ...agents.single_segment import SegmentResult, ServiceHealth
 from ...config import Config
 from ...llm.base import LLMClient
 from ...llm.routing import identity, inference_snapshot
@@ -38,11 +39,18 @@ class PrecisionBatchExecutor:
         *,
         checkpoint: Callable[[], None] | None = None,
         progress: Callable[[str], None] | None = None,
+        health: ServiceHealth | None = None,
     ) -> BatchResult:
         if not self._config.pipeline.polish:
             raise PrecisionError("Best-of-three translation requires polishing")
         return _PrecisionRun(
-            self._client, self._config, plan, store, checkpoint=checkpoint, progress=progress
+            self._client,
+            self._config,
+            plan,
+            store,
+            checkpoint=checkpoint,
+            progress=progress,
+            health=health,
         ).execute()
 
     @staticmethod
@@ -139,8 +147,10 @@ class _PrecisionRun:
         *,
         checkpoint: Callable[[], None] | None,
         progress: Callable[[str], None] | None,
+        health: ServiceHealth | None = None,
     ):
         self.client = client
+        self.health = health or ServiceHealth()
         self.config = config
         self.plan = plan
         self.store = store
@@ -190,11 +200,15 @@ class _PrecisionRun:
 
     def execute(self) -> BatchResult:
         saved = self.read("result")
+        retry_unresolved = False
         if saved is not None:
             result = self.result(saved)
-            self.prepare_publication(result)
-            PrecisionBatchExecutor.prepared_publication(self.store, result)
-            return result
+            # Refused segments are retried on the next run, reusing every accepted checkpoint.
+            if None not in result.targets:
+                self.prepare_publication(result)
+                PrecisionBatchExecutor.prepared_publication(self.store, result)
+                return result
+            retry_unresolved = True
         # Compatible paid outputs remain reusable within this semantic fingerprint.
         legacy = self.read("ready") or self.read("synthesis")
         self.prepare_metadata(legacy is not None)
@@ -215,22 +229,36 @@ class _PrecisionRun:
             if any(
                 any(character.isalpha() for character in source) for source in self.plan.sources
             ):
-                drafts = self.generate()
+                drafts, failures = self.generate()
                 with self.store.state_lock():
-                    recovered = self.records.completed("synthesis") if self.records else None
-                if recovered is None:
+                    recovered = self.records.progress("synthesis") if self.records else None
+                synthesis_failures: dict[int, str] = {}
+                if recovered is None or None in recovered[0]:
+                    resume, call_ref = recovered or (None, None)
                     self.notify("synthesis", "Combining and polishing three drafts")
                     agent = self.agent("synthesis")
-                    targets = self.targets(agent.synthesize(self.inputs, drafts))
-                    call_ref = agent.last_call_ref
+                    targets = self.targets(agent.synthesize(self.inputs, drafts, resume=resume))
+                    call_ref = agent.last_call_ref or call_ref
+                    synthesis_failures = agent.failures
                 else:
                     targets, call_ref = recovered
-                payload = self.references(self.targets(targets), drafts[0], call_ref)
+                targets, draft, degraded = self.degrade(
+                    self.targets(targets), drafts, failures, synthesis_failures
+                )
+                payload = self.references(targets, draft, call_ref)
+                payload["degraded"] = degraded
             else:
                 payload = self.references(list(self.plan.sources), list(self.plan.sources), None)
             result = self.result(payload)
             self.write("result", payload)
-            self.prepare_publication(result)
+            self.prepare_publication(result, replace=retry_unresolved)
+            for entry in result.degraded:
+                self.store.log_event(
+                    "precision_segment_degraded",
+                    chapter=self.plan.chapter,
+                    checkpoint=self.key,
+                    **entry,
+                )
             return result
         except Exception as error:
             self.store.log_event(
@@ -248,6 +276,7 @@ class _PrecisionRun:
                 tuple(self.targets(self.archive.get(payload["targets_ref"]))),
                 tuple(self.targets(self.archive.get(payload["draft_ref"]))),
                 precision_key=self.key,
+                degraded=tuple(payload.get("degraded", ())),
             )
 
     def prepare_metadata(self, legacy: bool) -> None:
@@ -275,7 +304,12 @@ class _PrecisionRun:
         )
 
     def references(
-        self, targets: list[str], draft: list[str], call_ref: str | None, *, legacy: bool = False
+        self,
+        targets: list[str | None],
+        draft: list[str | None],
+        call_ref: str | None,
+        *,
+        legacy: bool = False,
     ) -> dict[str, Any]:
         with self.store.state_lock():
             return {
@@ -285,10 +319,13 @@ class _PrecisionRun:
                 "legacy_unrecorded_request": legacy,
             }
 
-    def prepare_publication(self, result: BatchResult) -> None:
+    def prepare_publication(self, result: BatchResult, *, replace: bool = False) -> None:
+        """Write the publication index; ``replace`` re-prepares a rerun of unresolved segments."""
         key = f"{self.key}/publication.json"
         existing = self.store.read_artifact(key)
-        if existing is not None:
+        if replace:
+            existing = {**(existing or {}), "status": "ready"}
+        elif existing is not None:
             PrecisionBatchExecutor.prepared_publication(self.store, result)
             if existing.get("result_ref") == f"{self.key}/result.json":
                 return
@@ -307,14 +344,112 @@ class _PrecisionRun:
             },
         )
 
-    def targets(self, value: Any) -> list[str]:
+    def targets(self, value: Any) -> list[str | None]:
+        """Validate full-length targets; ``None`` marks a segment without accepted output."""
         if (
             not isinstance(value, list)
             or len(value) != len(self.plan.sources)
-            or any(not isinstance(text, str) for text in value)
+            or any(text is not None and not isinstance(text, str) for text in value)
         ):
             raise PrecisionError("Invalid precision output structure")
-        return PrecisionAgent._targets(self.inputs, [strip_ruby_markers(text) for text in value])
+        return PrecisionAgent._targets(
+            self.inputs, [None if text is None else strip_ruby_markers(text) for text in value]
+        )
+
+    def degrade(
+        self,
+        targets: list[str | None],
+        drafts: list[list[str | None]],
+        draft_failures: dict[int, str],
+        synthesis_failures: dict[int, str],
+    ) -> tuple[list[str | None], list[str | None], list[dict[str, Any]]]:
+        """Fill unsynthesized segments from drafts, then standard translation; never the source.
+
+        Returns final targets, the pre-polish draft per segment and one marker per degraded
+        segment. Segments that stay ``None`` are refused and retried by the next run.
+        """
+        final = list(targets)
+        before: list[str | None] = []
+        degraded: list[dict[str, Any]] = []
+        for offset, target in enumerate(final):
+            valid = [
+                (name, draft[offset])
+                for name, draft in zip(_DRAFT_IDS, drafts)
+                if draft[offset] is not None
+            ]
+            before.append(valid[0][1] if valid else None)
+            if target is not None or valid:
+                self.health.ok()
+            if target is not None:
+                if len(valid) < len(_DRAFT_IDS):
+                    # Synthesized from the remaining drafts after one draft failed this segment.
+                    degraded.append(
+                        {
+                            "segment": self.plan.segment_indices[offset],
+                            "position": self.plan.start_index + offset,
+                            "stage": "drafts",
+                            "fallback": "synthesis",
+                            "drafts": [name for name, _text in valid],
+                            "reason": draft_failures.get(offset, "unresolved"),
+                        }
+                    )
+                continue
+            if len(valid) >= 2:
+                stage, fallback = "synthesis", f"draft_{valid[0][0]}"
+                reason = synthesis_failures.get(offset, "unresolved")
+                final[offset] = valid[0][1]
+            elif valid:
+                stage, fallback = "drafts", f"draft_{valid[0][0]}"
+                reason = "single_valid_draft"
+                final[offset] = valid[0][1]
+            else:
+                stage, reason = "drafts", draft_failures.get(offset, "unresolved")
+                target, outcome = self.standard(offset)
+                final[offset] = before[offset] = target
+                fallback = "standard" if target is not None else "refused"
+                if outcome is not None:
+                    degraded.append(
+                        {
+                            "segment": self.plan.segment_indices[offset],
+                            "position": self.plan.start_index + offset,
+                            "stage": stage,
+                            "fallback": fallback,
+                            "reason": outcome.reason or reason,
+                            "tried": ["synthesis", "drafts", *outcome.tried],
+                            "routes": outcome.routes,
+                        }
+                    )
+                    continue
+            degraded.append(
+                {
+                    "segment": self.plan.segment_indices[offset],
+                    "position": self.plan.start_index + offset,
+                    "stage": stage,
+                    "fallback": fallback,
+                    "reason": reason,
+                }
+            )
+        return final, before, degraded
+
+    def standard(self, offset: int) -> tuple[str | None, SegmentResult | None]:
+        """Translate one segment with the plain-text chain, checkpointing only accepted output.
+
+        Returns the target and, for a refused segment, the chain outcome describing it.
+        """
+        stage = f"standard/{self.plan.segment_indices[offset]}"
+        cached = self.read(stage)
+        if cached is not None:
+            if not isinstance(cached.get("target"), str):
+                raise PrecisionError("Invalid standard fallback checkpoint")
+            return cached["target"], None
+        self.notify("standard", "Translating a segment without valid drafts")
+        outcome = PrecisionAgent(self.client, self.config).translate_standard(self.inputs, offset)
+        self.health.record(outcome)
+        if outcome.target is None:
+            return None, outcome
+        target = strip_ruby_markers(outcome.target)
+        self.write(stage, {"target": target})
+        return target, None
 
     def read(self, stage: str) -> dict[str, Any] | None:
         record = self.store.read_artifact(f"{self.key}/{stage}.json")
@@ -354,18 +489,22 @@ class _PrecisionRun:
             checkpoint=self.key,
         )
 
-    def generate(self) -> list[list[str]]:
-        candidates: dict[str, list[str]] = {}
-        pending: list[str] = []
+    def generate(self) -> tuple[list[list[str | None]], dict[int, str]]:
+        """Return the three drafts plus, per segment, the reason of the last draft failure.
+
+        Accepted segments are reused from receipts; only missing segments are requested.
+        """
+        candidates: dict[str, list[str | None]] = {}
+        resume: dict[str, list[str | None] | None] = {}
         for candidate in _DRAFT_IDS:
             cached = self.read(f"drafts/{candidate}")
             if cached is None:
                 with self.store.state_lock():
                     recovered = (
-                        self.records.completed(f"drafts/{candidate}") if self.records else None
+                        self.records.progress(f"drafts/{candidate}") if self.records else None
                     )
-                if recovered is None:
-                    pending.append(candidate)
+                if recovered is None or None in recovered[0]:
+                    resume[candidate] = recovered[0] if recovered else None
                 else:
                     targets, call_ref = recovered
                     with self.store.state_lock():
@@ -388,40 +527,50 @@ class _PrecisionRun:
                             self.store.write_artifact(
                                 meta_key, {**meta, "legacy_unrecorded_requests": True}
                             )
-        if pending:
+                if None in candidates[candidate]:
+                    # A degraded draft is retried for its missing segments on a later run.
+                    resume[candidate] = candidates.pop(candidate)
+        failures: dict[int, str] = {}
+        if resume:
             self.notify("drafts", "Generating three translations")
 
-            def compute(candidate: str) -> dict[str, Any]:
+            def compute(candidate: str) -> tuple[dict[str, Any], dict[int, str]]:
                 agent = self.agent(f"drafts/{candidate}")
-                targets = self.targets(agent.translate(self.inputs))
+                targets = self.targets(agent.translate(self.inputs, resume=resume[candidate]))
                 with self.store.state_lock():
                     return {
                         "targets_ref": self.archive.put(targets),
                         "call_ref": agent.last_call_ref,
-                    }
+                    }, agent.failures
 
-            failures: list[Exception] = []
+            errors: list[Exception] = []
+            reasons_by_candidate: dict[str, dict[int, str]] = {}
             with (
                 self.client.interrupt_scope(),
                 ThreadPoolExecutor(max_workers=len(_DRAFT_IDS)) as pool,
             ):
-                futures = {pool.submit(compute, candidate): candidate for candidate in pending}
+                futures = {pool.submit(compute, candidate): candidate for candidate in resume}
                 for future in as_completed(futures):
                     candidate = futures[future]
                     try:
-                        payload = future.result()
+                        payload, reasons = future.result()
                     except Exception as error:
-                        failures.append(error)
+                        errors.append(error)
                         continue
                     try:
                         self.write(f"drafts/{candidate}", payload)
                     except Exception as error:
                         # Retain completed siblings before propagating an orderly interruption.
-                        failures.append(error)
+                        errors.append(error)
                     with self.store.state_lock():
                         candidates[candidate] = self.targets(
                             self.archive.get(payload["targets_ref"])
                         )
-            if failures:
-                raise failures[0]
-        return [candidates[candidate] for candidate in _DRAFT_IDS]
+                    reasons_by_candidate[candidate] = reasons
+            if errors:
+                raise errors[0]
+            # Completion order varies; report the first failing draft in T1-T3 order.
+            for candidate in _DRAFT_IDS:
+                for offset, reason in reasons_by_candidate.get(candidate, {}).items():
+                    failures.setdefault(offset, reason)
+        return [candidates[candidate] for candidate in _DRAFT_IDS], failures

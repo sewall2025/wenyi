@@ -41,6 +41,9 @@ class ResolvedRoute:
     model_identity: str
     fingerprint: str
     fallbacks: tuple[str, ...] = ()
+    # Local request budgeting and request shape; neither changes inference identity.
+    context_window: int | None = None
+    batch_output: bool = True
 
     def request_model(self) -> ResolvedModel:
         options = (
@@ -84,9 +87,15 @@ def model_route(
         "model": model.model,
         "adapter_protocol": adapter.protocol_version,
         "options": options.model_dump(mode="json"),
-        "max_output_tokens": limit,
-        # Transport-only switches such as ``stream`` do not change output or resume identity.
-        "connection_options": connection_options.model_dump(mode="json", exclude={"stream"}),
+        # ponytail: pinned placeholder keeps fingerprints of routes without an explicit output
+        # limit byte-identical to earlier releases; drop the key on the next identity bump.
+        "max_output_tokens": None,
+        # Transport switches (``stream``, ``structured_output``) and request budgets
+        # (``max_output_tokens``, ``context_window``, ``batch_output``) do not change resume
+        # identity; replies are still validated locally against the same contract.
+        "connection_options": connection_options.model_dump(
+            mode="json", exclude={"stream", "structured_output"}
+        ),
     }
     return ResolvedRoute(
         operation,
@@ -105,6 +114,8 @@ def model_route(
             {"operation": operation, "protocol": spec.protocol_version, "inference": physical_model}
         ),
         fallbacks,
+        model.context_window,
+        model.batch_output,
     )
 
 
@@ -138,6 +149,17 @@ def resolve_routes(config: LLMConfig) -> Mapping[str, ResolvedRoute]:
         result = model_route(
             config, operation, profile, origin=origin, tier=tier, fallbacks=fallbacks
         )
+        batched = [config.models[name].batch_output for name in (profile, *fallbacks)]
+        if not all(batched) and not spec.plain_text:
+            raise ValueError(
+                f"{operation}: batch_output: false is only supported for "
+                "translation.body and polish.body"
+            )
+        if result.batch_output and not all(batched):
+            raise ValueError(
+                f"{operation}: fallback models must not disable batch_output "
+                "when the primary model sends batches"
+            )
         resolved[operation] = result
         return result
 

@@ -213,6 +213,17 @@ class ReviewService:
             review_dir=debug.run_dir,
             reviewed_content_digest=reviewed_content_digest,
         )
+        untranslated = [
+            {"chapter": chapter.index, "segment": segment.index}
+            for chapter in loaded
+            for segment in chapter.text_segments
+            if segment.target is None
+        ]
+        if untranslated:
+            # Refused segments are skipped by every reviewer chunk; list them once per run.
+            store.log_event(
+                "review_untranslated_segments", count=len(untranslated), segments=untranslated
+            )
 
         return ReviewInputs(loaded, analysis, debug)
 

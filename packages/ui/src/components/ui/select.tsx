@@ -34,13 +34,15 @@ type SelectProps = Omit<
   children: React.ReactNode;
   name?: string;
   required?: boolean;
+  /** Shown while the value is empty. */
+  placeholder?: string;
 };
 
 export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
   (
     {
       value, defaultValue = "", onValueChange, children, name, required,
-      disabled, className, form, ...props
+      disabled, className, form, placeholder, ...props
     },
     ref,
   ) => {
@@ -58,7 +60,7 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
       <Primitive.Root
         open={open}
         onOpenChange={setOpen}
-        value={encode(current)}
+        value={placeholder !== undefined && current === "" ? "" : encode(current)}
         onValueChange={(encoded) => {
           const next = encoded.slice("value:".length);
           setInternalValue(next);
@@ -84,7 +86,7 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
             className,
           )}
         >
-          <Primitive.Value />
+          <Primitive.Value placeholder={placeholder} />
           <Primitive.Icon asChild>
             <ChevronDown className="h-4 w-4 shrink-0 opacity-60" />
           </Primitive.Icon>

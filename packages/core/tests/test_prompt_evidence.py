@@ -140,12 +140,12 @@ def test_local_notes_survive_alignment_retry_and_individual_fallback(fallback):
     )
     count = 0
 
-    def handler(*_):
+    def handler(messages, tier, json_mode):
         nonlocal count
         count += 1
         if count == 1 or (fallback and count == 2):
             return '{"translations": []}'
-        return json.dumps({"translations": ["译文"] if fallback else ["甲", "乙"]})
+        return json.dumps({"translations": ["甲", "乙"]}) if json_mode else "译文"
 
     client = FakeClient(handler=handler)
     terms = [
@@ -158,8 +158,14 @@ def test_local_notes_survive_alignment_retry_and_individual_fallback(fallback):
     for call in client.calls:
         user = call["messages"][1]["content"]
         assert "untrusted read-only evidence, not source text" in user
+        plain = None if call["json_mode"] else user.split("paragraph to translate]\n", 1)[1]
         for term in terms:
-            assert (term.note in user) == (f"] {term.source}" in user)
+            translated = (
+                f"] {term.source}" in user
+                if plain is None
+                else plain.split("\n\n", 1)[0] == term.source
+            )
+            assert (term.note in user) == translated
 
 
 @pytest.mark.parametrize("invalid_continuation", [False, True])

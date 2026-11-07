@@ -199,6 +199,10 @@ class TestAssembleText(unittest.TestCase):
                 1,
                 Segment(index=1, source="2", kind="heading", cont=True, meta={"heading_level": 1}),
             )
+            # Refused (None) targets export a placeholder; keep the text under test visible.
+            for each in document.chapters:
+                for segment in each.segments:
+                    segment.target = segment.source
             store = FileStorage(os.path.join(directory, "state"))
             store.init_from_document(document)
             manifest = store.load_manifest()
@@ -771,6 +775,8 @@ data-tn-annotation-id="ann-0" href="notes.xhtml#note-1">border tunnel
         html = """<html><body><p>Before<sup><a class="noteref"
 href="#n1" id="ref-1">1</a></sup> after.</p></body></html>"""
         _title, segments, template = annotate_epub_resource(html, 0, "body.xhtml")
+        for segment in segments:  # A translation identical to the source keeps the template.
+            segment.target = segment.source
 
         rendered = BeautifulSoup(
             _render_segments_html(template, segments),

@@ -15,6 +15,9 @@ from pydantic import BaseModel, Field
 KIND_TEXT = "text"
 KIND_HEADING = "heading"
 
+# Export stand-in for a segment every model refused (``target is None``); never the source.
+UNTRANSLATED_PLACEHOLDER = "[untranslated]"
+
 
 class Segment(BaseModel):
     """One translatable unit."""

@@ -131,7 +131,7 @@ def _assemble_html(
             continue
 
         # Template-free inputs such as TXT and Markdown must also export their body text.
-        for kind, target, source, level in _merged_paragraphs(ch):
+        for kind, target, source, level in _merged_paragraphs(ch, bilingual=bilingual):
             if kind == KIND_HEADING:
                 level = min(level, 6)
                 target_html = f"<h{level}>{escape(target)}</h{level}>"

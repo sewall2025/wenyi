@@ -58,7 +58,8 @@ def test_historical_calls_reconstruct_messages_outputs_and_share_results(tmp_pat
         assert record["model_elapsed_ms"] >= 0
         assert record["effective_model_known"] is False
         assert record["usage_known"] is False
-        assert json.loads(record["raw_response"])["translations"] == record["targets"]
+        translations = json.loads(record["raw_response"])["translations"]
+        assert list(translations.values()) == record["targets"]
     saved = _artifact(store, f"{result.precision_key}/result.json")["payload"]
     first = _artifact(store, f"{result.precision_key}/drafts/T1.json")["payload"]
     assert saved["draft_ref"] == first["targets_ref"]
@@ -66,38 +67,32 @@ def test_historical_calls_reconstruct_messages_outputs_and_share_results(tmp_pat
 
 
 @pytest.mark.parametrize("retry_limit", [0, 2])
-def test_failed_output_keeps_each_response_and_resume_adds_only_missing_call(tmp_path, retry_limit):
+def test_failed_output_keeps_each_response_and_degraded_result_is_reused(tmp_path, retry_limit):
     store, config, handler = _store(tmp_path), _config(tmp_path), Handler(invalid=True)
     config.pipeline.align_retry_limit = retry_limit
     client = MeteredFakeClient(handler=handler)
     executor = PrecisionBatchExecutor(client, config)
-    with pytest.raises(ValueError):
-        executor.execute(_plan(store), store)
+    result = executor.execute(_plan(store), store)
     keys = [
         key for key in store.list_artifacts("precision/chapters/0/") if "/calls/synthesis/" in key
     ]
-    assert len(keys) == 1 + config.pipeline.align_retry_limit
+    # One zero-progress batch round, then each id alone until its retries end or reply repeats.
+    attempts = 1 + 2 * min(2, 1 + retry_limit)
+    assert len(keys) == attempts
     failures = {key: load_precision_call(store, key) for key in keys}
     for failed in failures.values():
         assert failed["status"] == "failed"
         assert failed["error_category"] == "invalid_output"
         assert json.loads(failed["raw_response"]) == {"translations": []}
         assert "targets" not in failed
-    with pytest.raises(ValueError):
-        executor.execute(_plan(store), store)
-    keys = [
-        key for key in store.list_artifacts("precision/chapters/0/") if "/calls/synthesis/" in key
-    ]
-    assert len(keys) == 2 * (1 + config.pipeline.align_retry_limit)
-    assert {key: load_precision_call(store, key) for key in failures} == failures
-    failures = {key: load_precision_call(store, key) for key in keys}
+    assert len(result.degraded) == 2
     handler.invalid = False
-    result = executor.execute(_plan(store), store)
-    assert len(client.calls) == 4 + len(keys)
-    assert len(calls(store, result)) == 4 + len(keys)
+    assert executor.execute(_plan(store), store) == result
+    assert len(client.calls) == 3 + attempts
+    assert len(calls(store, result)) == 3 + attempts
     assert handler.counts["translate"] == 3
     assert {key: load_precision_call(store, key) for key in keys} == failures
-    assert client.usage_summary()["totals"]["total_tokens"] == 8 * (4 + len(keys))
+    assert client.usage_summary()["totals"]["total_tokens"] == 8 * (3 + attempts)
 
 
 @pytest.mark.parametrize("failure", ["invalid_output", "truncated", "interrupt"])
@@ -228,9 +223,11 @@ def test_completed_paid_receipt_recovers_gap_before_stage_checkpoint(
     with pytest.raises(RuntimeError, match="gap"):
         executor.execute(_plan(store), store)
     result = executor.execute(_plan(store), store)
-    assert len(client.calls) == 4 + invalid_first
-    assert len(calls(store, result)) == 4 + invalid_first
-    assert client.usage_summary()["totals"]["total_tokens"] == 8 * (4 + invalid_first)
+    # A zero-progress synthesis round falls back to one request per segment.
+    expected = 4 + 2 * invalid_first
+    assert len(client.calls) == expected
+    assert len(calls(store, result)) == expected
+    assert client.usage_summary()["totals"]["total_tokens"] == 8 * expected
 
 
 def test_missing_publication_result_is_not_silently_skipped(tmp_path, monkeypatch):

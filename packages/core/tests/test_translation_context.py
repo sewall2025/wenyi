@@ -272,11 +272,14 @@ def test_alignment_retries_and_singletons_use_the_actual_following_source(config
 
     def handler(messages, tier, json_mode):
         user = messages[-1]["content"]
+        if not json_mode:  # Plain-text single-paragraph fallback.
+            source = user.split("paragraph to translate]\n", 1)[1].split("\n\n", 1)[0]
+            references.append(([source], _next_source(user)))
+            return "translated"
         sources = _numbered_sources(user)
         references.append((sources, _next_source(user)))
         # Force count recovery, including an erroneous translation of the reference.
-        targets = ["first", "second", "extra"] if len(sources) > 1 else ["translated"]
-        return json.dumps({"translations": targets})
+        return json.dumps({"translations": ["first", "second", "extra"]})
 
     result = Translator(FakeClient(handler=handler), config).translate_batch(
         ["first source", "42", "second source"], next_source="outside batch"
@@ -509,14 +512,16 @@ def test_resume_after_target_save_completes_glossary_without_retranslation(
 
 @pytest.mark.parametrize("checkpoint_saved", [False, True])
 @pytest.mark.parametrize("polish", [False, True])
-def test_resume_refreshes_full_glossary_before_pending_batches(
+def test_resume_refreshes_cited_glossary_before_pending_batches(
     tmp_path, config, monkeypatch, checkpoint_saved, polish
 ):
-    """Keep saved targets and refresh the full glossary after recovering extraction."""
+    """Keep saved targets and refresh the cited glossary after recovering extraction."""
     config.pipeline.polish = polish
     source = tmp_path / "book.txt"
     source.write_text(
-        "Alice waited by the window.\n\nThe door opened slowly.\n\nA letter arrived later.",
+        "Alice waited by the window.\n\n"
+        "Apple and Zebra watched Alice open the door Outside.\n\n"
+        "A letter from Apple, Zebra and Outside reached Alice.",
         encoding="utf-8",
     )
 
@@ -530,9 +535,10 @@ def test_resume_refreshes_full_glossary_before_pending_batches(
 
     first = Orchestrator(config, client=FakeClient(handler=handler))
     store = first.prepare(str(source))
-    # Append in a deliberately nonalphabetical order; neither source occurs in the book.
+    # Append in a deliberately nonalphabetical order that differs from the source order.
     store.upsert_term(GlossaryTerm(source="Zebra", target="斑马"))
     store.upsert_term(GlossaryTerm(source="Apple", target="苹果"))
+    store.upsert_term(GlossaryTerm(source="Unseen", target="未见"))
     extract = first._translation.extract_batch_glossary
 
     def interrupt(*args, **kwargs):
@@ -569,6 +575,7 @@ def test_resume_refreshes_full_glossary_before_pending_batches(
         assert "Alice → 爱丽丝" in user
         assert "Outside → 外部术语" in user
         assert user.index("Zebra → 斑马") < user.index("Apple → 苹果")
+        assert "Unseen" not in user
         assert "Alice waited by the window." not in _numbered_sources(user)
     cached_client = FakeClient(handler=handler)
     Orchestrator(config, client=cached_client).run(str(source))

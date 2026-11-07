@@ -188,6 +188,10 @@ async def translate_chapter(pid: str, ci: int) -> dict:
     )
     if chapter is None:
         raise ApiError(CHAPTER_NOT_FOUND, 404, "chapter not found")
-    if chapter["status"] == "done":
+    # A finished chapter with refused (untranslated) segments may be retried, e.g. after a
+    # model change; the run only re-requests those segments.
+    if chapter["status"] == "done" and chapter.get("target_word_count", 0) >= chapter.get(
+        "word_count", 0
+    ):
         raise HTTPException(409, "chapter is already translated")
     return await start_job(pid, "chapter_translation", params={"chapter_index": ci})

@@ -418,8 +418,8 @@ class TestDocxStyles(unittest.TestCase):
                 }
             )
             chapter = book.chapters[0]
-            # An empty target falls back to source during export.
-            chapter.segments[0].target = None
+            # A blank saved target falls back to source during export.
+            chapter.segments[0].target = ""
             store.save_chapter(chapter)
             out_path = os.path.join(directory, "out.docx")
             _assemble_docx(store, out_path)
@@ -511,6 +511,7 @@ class TestDocxAssemble(unittest.TestCase):
                 self.assertEqual(chapter.meta["heading_level"], level)
                 for segment in chapter.segments:
                     self.assertIsNone(segment.target)
+                    segment.target = segment.source  # None would export the placeholder.
                     if segment.kind == KIND_HEADING:
                         segment.meta.pop("heading_level", None)
                 store.save_chapter(chapter)

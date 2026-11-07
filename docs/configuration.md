@@ -51,7 +51,10 @@ translation mode and languages. Restoring defaults cannot
 remove models still selected by other projects; change those selections first.
 Operation selectors show the effective tier directly, without a “Follow default tier”
 prefix. Selecting the operation's default tier clears its model override and preserves
-any configured fallbacks. Concurrent global saves use a revision check;
+any configured fallbacks. Each model form in **Models & connections** has optional
+**Context window** and **Max output** fields (blank means unknown) and a **Batch JSON
+output** switch that maps to the model fields described under
+[Configuration rules](#configuration-rules). Concurrent global saves use a revision check;
 a stale editor must reload before saving again.
 
 ## Languages
@@ -143,8 +146,12 @@ Replace `YOUR_EDITOR_MODEL` with a model supported by your endpoint. Other opera
 
 ### Configuration rules
 
-- `providers.<id>` defines a connection: `kind`, optional `base_url`, `api_key_env`, `timeout` (seconds, default 600), `max_retries` (additional attempts, default 4), `max_concurrency` (unlimited unless set), and optional `quota_group`.
-- `models.<id>` defines a request profile: `provider` connection ID, remote `model` ID, optional positive `max_output_tokens`, and adapter-specific `options`.
+- `providers.<id>` defines a connection: `kind`, optional `base_url`, `api_key_env`, `timeout` (seconds, default 600), `max_retries` (additional attempts, default 4), `max_concurrency` (unlimited unless set), and optional `quota_group`. A `context_window` on a connection is deprecated: Wenyi moves it to every model on that connection that has no value of its own (a model's own value wins) and prints a deprecation warning. Move it to the models to silence the warning.
+- `models.<id>` defines a request profile: `provider` connection ID, remote `model` ID, optional positive `max_output_tokens`, optional positive `context_window`, optional `batch_output` (default `true`), and adapter-specific `options`.
+  - `context_window` is the prompt plus output tokens the model accepts. Batch, single-paragraph and best-of-three translation requests that would exceed it are split or trimmed locally before sending. Set it to the model's documented limit, for example `24576` for a 24K model. Without it Wenyi learns the limit only after the provider rejects or truncates a request, and keeps the learned value for the current invocation.
+  - `max_output_tokens` is sent as the request's output limit (`max_tokens`, or the provider's equivalent). The context-window check reserves this many tokens for the reply; without it, the check reserves three times the source tokens.
+  - `batch_output: false` stops sending numbered JSON batches to the model. Use it for dedicated translation models that ignore JSON instructions. Standard translation and best-of-three drafts then request one plain-text paragraph at a time, with the same trimming, sentence-by-sentence and refusal fallbacks. Best-of-three synthesis on such a model also runs one paragraph at a time: the request carries the source and the distinct drafts and expects only the final translation. This sends more requests. Only `translation.body` and `polish.body` support it; routing any other operation to the model (including through a tier) fails validation, and fallbacks of a batching primary must also batch. Standard-mode polishing needs aligned JSON lists, so when `polish.body` uses such a model the polishing pass is skipped and a `polish_skipped` event is logged.
+  - `context_window`, `max_output_tokens` and `batch_output` do not change route identity or resume state. Changing them keeps completed batches, caches and Review evidence reusable.
 - `tiers` maps exactly `strong`, `cheap`, and `fast` to profiles. Without a preset, all three are required; they can select the same profile. Tier names describe preferences, not measured quality or price.
 - `routes.<operation>` selects exactly one of `{model: profile}` or `{tier: strong}`. Unknown operations, fields and references fail before requests. There is no missing-tier fallback.
 - Preset overrides replace whole connection/profile entries by ID. Repeat required fields when replacing an entry; model options are not merged across profiles. Tier and route mappings replace individual keys.
@@ -167,9 +174,11 @@ Replace `YOUR_EDITOR_MODEL` with a model supported by your endpoint. Other opera
 
 Compatible endpoints accept `reasoning_style: none` (default), `deepseek`, `openai`, or `openrouter`. `json_response_fallback: reasoning_content` is an explicit option for gateways placing JSON there; the default is `none`, and non-JSON reasoning is never accepted. Gemini thinking level and thinking budget are mutually exclusive. Raw extension dictionaries are endpoint-specific; offline validation cannot prove a remote model supports them.
 
-Every OpenAI-compatible connection (all kinds except `gemini` and `fake`) accepts `stream: true` (default) or `stream: false`. Streaming requests usage in the final chunk with `stream_options.include_usage`, so gateways do not drop long requests as idle. With streaming, `timeout` limits the wait between chunks, not the whole request; use `budget.deadline_seconds` to bound total run time. Set `stream: false` for older gateways that reject `stream_options`. The switch does not change model output or resume identity.
+Every OpenAI-compatible connection (all kinds except `gemini` and `fake`) accepts `stream: true` (default) or `stream: false`. Streaming requests usage in the final chunk with `stream_options.include_usage`, so gateways do not drop long requests as idle. With streaming, `timeout` also caps each attempt's total duration: Wenyi closes the stream when it is exceeded and retries the attempt as a timeout. A stream that sends no content, reasoning, finish reason or usage for `timeout` seconds or 5 minutes, whichever is shorter, is closed and retried the same way, so SSE keep-alives cannot hold it open. Long streams emit an `llm_stream_progress` event about every 30 seconds with chunk and character counts. Use `budget.deadline_seconds` to bound total run time. Set `stream: false` for older gateways that reject `stream_options`. The switch does not change model output or resume identity.
 
-Provider SDK retries are disabled. Wenyi retries transient connections/timeouts, HTTP 408/409/429 and 5xx responses, empty responses, and streams that end without a finish reason through one shared policy; partial streamed text is discarded. Retry backoff releases the connection permit and responds to cancellation. Ordinary 4xx errors are not retried. PDF's default MinerU import uses a separate `MINERU_API_KEY`; the optional BabelDOC HTTP bridge is independent of model routing.
+The same connections accept `structured_output: none` (default) or `structured_output: json_schema`. With `json_schema`, requests that carry a schema (currently best-of-three precision translation) send `response_format` type `json_schema` with `strict: true` instead of `json_object`, so the model must return exactly the requested paragraph ids. Enable it only when the provider and model support strict JSON schema; otherwise the request fails with a provider error. Other JSON requests keep `json_object`. Local output validation still runs, and the option does not affect routing identity or resume state.
+
+Provider SDK retries are disabled. Wenyi retries transient connections/timeouts, HTTP 408/409/429 and 5xx responses, empty responses, and streams that end without a finish reason through one shared policy; partial streamed text is discarded, but the attempt's reported usage is still counted. A JSON-mode stream that ends without a finish reason but holds one complete, strictly parsable JSON document is accepted and logged as a `stream_missing_finish_reason` event. Retry events for cut-off streams carry a short `diagnostic` (chunk count, character counts, whether usage arrived and the last 80 characters). An error event sent inside a started stream (`data: {"error": ...}`) is retried as `stream_error`, with a `diagnostic` holding only the error `code`, `type` and message length; events whose code or type is `context_length_exceeded` or `invalid_request_error` are not retried. Retry backoff releases the connection permit and responds to cancellation. Ordinary 4xx errors are not retried. PDF's default MinerU import uses a separate `MINERU_API_KEY`; the optional BabelDOC HTTP bridge is independent of model routing.
 
 The global **MinerU PDF parsing** settings card is separate from model connections.
 Web and CLI use `MINERU_API_KEY` from the deployment/process environment. Desktop checks
@@ -251,9 +260,9 @@ llm:
 
 Connections sharing a `quota_group` share RPM/TPM reservations within one invocation. Provider concurrency also spans every operation using that connection. These controls do not coordinate other processes or enforce an account's actual remote quota. Token controls reserve a conservative prompt-byte estimate plus an explicit output limit, then adjust it when actual usage arrives; reservations are not billed usage or a currency spending cap. Token limits require finite output limits for every reachable primary and fallback profile.
 
-`deadline_seconds` and Ctrl+C stop queued requests and backoff cooperatively. An in-flight SDK call can finish or reach its connection timeout; completed work is retained for resume. A stopped invocation gets a new budget on restart.
+`deadline_seconds` and Ctrl+C stop queued requests and backoff cooperatively. Cancellation (Ctrl+C, Web/Desktop pause, Desktop shutdown) also closes in-flight streamed responses within seconds and is never retried; a non-streamed SDK call can still finish or reach its connection timeout. Completed work is retained for resume. A stopped invocation gets a new budget on restart.
 
-For stateless requests, an explicit route may use `fallbacks: [backup_profile]`. Wenyi tries that chain only after a retryable transport failure exhausts retries. Authentication, configuration and output-schema errors do not trigger model failover. Resumable `review.verify`, `review.arbitrate`, and `autofix.verify` conversations reject failover to prevent mixed-model traces.
+For stateless requests, an explicit route may use `fallbacks: [backup_profile]`. In Web/Desktop settings, each step's model selector has an ordered fallback list: add, reorder or remove registered models; the step's primary model and duplicates are not offered. The list is disabled on resumable evidence-conversation steps. Wenyi tries that chain only after a retryable transport failure exhausts retries. Authentication, configuration and output-schema errors do not trigger model failover. Resumable `review.verify`, `review.arbitrate`, and `autofix.verify` conversations reject failover to prevent mixed-model traces.
 
 ### Usage and resume
 
@@ -327,7 +336,7 @@ pipeline:
 ```
 
 - `review`: enabled by default; automatically run the evidence-driven whole-book review after the complete book has been translated. Pass `--no-review` or set this to `false` to skip it in the one-command workflow. The explicit `wenyi review` command remains available.
-- `align_retry_limit`: additional attempts for invalid model-output structure; the default `2` allows three attempts including the initial request, and `0` disables these retries. Standard translation falls back to individual paragraphs after exhaustion. Precision uses the same budget for each initial draft and synthesis, retries only the failing stage with unchanged context, and pauses after exhaustion without paragraph splitting. Actual requests, including failed attempts, incur provider usage; transport retries remain separate.
+- `align_retry_limit`: additional attempts for invalid model-output structure; the default `2` allows three attempts including the initial request, and `0` disables these retries. Standard translation falls back to individual paragraphs after exhaustion. Precision first re-requests only missing or invalid paragraph ids with unchanged context; after a round resolves nothing, each remaining paragraph is requested alone and uses this budget, and the batch pauses if one still fails. Actual requests, including failed attempts, incur provider usage; transport retries remain separate.
 - `polish`: run the strong model over translated batches again for style. This may improve quality but significantly increases runtime and cost.
 - `rolling_context_tokens`: budget for preceding translations, measured with tiktoken `cl100k_base`, including newline separators; default `512`, minimum `0`. Select the newest contiguous complete paragraphs that fit. If the newest nonempty paragraph alone exceeds the budget, include only its Unicode-safe tail. Context is reconstructed from formal chapter targets, not a separate persisted cache; existing `context.json` files are ignored and left untouched. Translation and polishing still receive the built-in following source reference when this value is zero; see [whole-book context](pipeline.md#whole-book-understanding-and-context).
 - The former `rolling_context_segments` key is no longer accepted; replace it with `rolling_context_tokens`. There is no automatic segment-to-token conversion.
@@ -353,8 +362,8 @@ pipeline:
 The command-line flags `--polish`, `--no-polish`, `--review`, and `--no-review`
 override the corresponding configuration values for a `translate` run.
 
-Body translation and fresh Reviewer requests always receive the full glossary; there
-is no scope selector. Remove `pipeline.glossary_scope` from existing YAML or project
+Body translation receives only the glossary entries cited by each batch, and fresh
+Reviewer requests receive the full glossary; there is no scope selector. Remove `pipeline.glossary_scope` from existing YAML or project
 configuration: the retired key is rejected, including `full`. See [glossary policy](pipeline.md#glossary)
 for snapshot refresh, resume behavior, and the prompt-size tradeoff.
 

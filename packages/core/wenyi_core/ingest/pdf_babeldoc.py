@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ..models.document import UNTRANSLATED_PLACEHOLDER
 from ..pdf_bridge import BabeldocBridgeClient, BabeldocBridgeError
 from .models import KIND_HEADING, KIND_TEXT, Chapter, Document, Segment
 
@@ -333,7 +334,10 @@ def read_pdf_babeldoc(
 
 
 def translations_from_store(store) -> tuple[str, str, dict[str, str]]:
-    """Collect fillback text, falling back to source for blank targets without saving it."""
+    """Collect fillback text, falling back to source for blank targets without saving it.
+
+    Refused segments (``target is None``) get the untranslated placeholder instead.
+    """
     manifest = store.load_manifest()
     meta = manifest.get("meta") if isinstance(manifest.get("meta"), dict) else {}
     session_id = meta.get("babeldoc_session_id")
@@ -356,7 +360,9 @@ def translations_from_store(store) -> tuple[str, str, dict[str, str]]:
             # The bridge requires nonblank text for every parsed paragraph ID.
             # Polishing can blank layout-only units such as a standalone period.
             text = segment.target
-            if text is None or not text.strip():
+            if text is None and any(char.isalpha() for char in segment.source):
+                text = UNTRANSLATED_PLACEHOLDER
+            elif text is None or not text.strip():
                 text = segment.source
             if text is None or not str(text).strip():
                 continue

@@ -6,13 +6,14 @@ import os
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict
 
 from .configuration import ProviderConfig
-from .retrying import RetryReporter, provider_retry
+from .retrying import RetryReporter, context_length_error, provider_retry
 from .usage import UsageSample
 
 OptionsT = TypeVar("OptionsT", bound=BaseModel)
@@ -41,6 +42,10 @@ class RequestContext:
     attempt_scope: Callable[..., Any]
     sleep: Callable[[float], None] | None = None
     redact_diagnostic: Callable[[str], str] | None = None
+    # Optional JSON-mode schema; each adapter decides whether its protocol can enforce it.
+    json_schema: dict[str, Any] | None = None
+    # Registers an open stream so cancellation can close it; raises the cancellation on exit.
+    track_stream: Callable[[Any], AbstractContextManager[Any]] | None = None
 
 
 class ProviderAdapter(ABC):
@@ -102,7 +107,16 @@ class ProviderAdapter(ABC):
         @provider_retry(self.cfg.max_retries, reporter, sleep=context.sleep)
         def request() -> str:
             with context.attempt_scope():
-                return self._request(messages, model, json_mode=json_mode, context=context)
+                try:
+                    return self._request(messages, model, json_mode=json_mode, context=context)
+                except Exception as error:
+                    overflow = context_length_error(
+                        error, provider=self.cfg.kind, operation=context.operation
+                    )
+                    if overflow is None or overflow is error:
+                        raise
+                    # Classify before the retry policy sees it: resending cannot shrink the input.
+                    raise overflow from error
 
         return request()
 

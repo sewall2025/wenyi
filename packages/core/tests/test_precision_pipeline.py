@@ -21,6 +21,7 @@ from tests.precision_fixtures import artifact as _artifact
 from tests.precision_fixtures import precision_config as _config
 from tests.precision_fixtures import precision_plan as _plan
 from tests.precision_fixtures import precision_store as _store
+from tests.precision_fixtures import segment_ids
 
 
 def test_four_calls_produce_synthesis_directly_and_keep_first_draft_for_comparison(tmp_path):
@@ -59,24 +60,28 @@ def test_resume_each_checkpoint_reuses_completed_work(tmp_path, boundary):
     assert len(client.calls) == 4
 
 
-def test_invalid_synthesis_is_not_published_and_drafts_are_not_regenerated(tmp_path):
+def test_invalid_synthesis_falls_back_to_first_draft_without_regenerating(tmp_path):
     store, config, handler = _store(tmp_path), _config(tmp_path), Handler(invalid=True)
     client = MeteredFakeClient(handler=handler)
     executor = PrecisionBatchExecutor(client, config)
-    with pytest.raises(PrecisionError):
-        executor.execute(_plan(store), store)
-    attempts = 1 + config.pipeline.align_retry_limit
-    assert len(client.calls) == 3 + attempts
-    handler.invalid = False
     result = executor.execute(_plan(store), store)
-    assert len(client.calls) == 4 + attempts
-    assert handler.counts["translate"] == 3
-    assert result.targets == (f"润{attempts + 1}:0", f"润{attempts + 1}:1")
+    # The zero-progress batch halves to single ids; each stops when its reply repeats.
+    synthesis_calls = 1 + 2 * 2
+    assert len(client.calls) == 3 + synthesis_calls
+    first = _artifact(store, f"{result.precision_key}/drafts/T1.json")["payload"]
+    assert list(result.targets) == PrecisionArchive(store).get(first["targets_ref"])
+    assert result.before_polish == result.targets
+    assert [entry["fallback"] for entry in result.degraded] == ["draft_T1", "draft_T1"]
+    assert {entry["reason"] for entry in result.degraded} == {"repeated_reply"}
+    # The degraded result is final for this fingerprint and is reused without new calls.
+    handler.invalid = False
+    assert executor.execute(_plan(store), store) == result
+    assert len(client.calls) == 3 + synthesis_calls
     assert all(segment.target is None for segment in store.load_chapter(0).text_segments)
 
 
 @pytest.mark.parametrize("stage", ["translate", "synthesis"])
-def test_structural_retry_repeats_only_failed_request_and_reuses_success(tmp_path, stage):
+def test_zero_progress_round_requests_each_segment_and_reuses_success(tmp_path, stage):
     store, config, handler = _store(tmp_path), _config(tmp_path), Handler()
     lock = Lock()
     failed_messages = []
@@ -95,36 +100,37 @@ def test_structural_retry_repeats_only_failed_request_and_reuses_success(tmp_pat
     client = MeteredFakeClient(handler=fail_once)
     executor = PrecisionBatchExecutor(client, config)
     result = executor.execute(_plan(store), store)
-    assert len(client.calls) == 5
+    assert len(client.calls) == 6
     assert handler.counts == {
-        "translate": 3 + (stage == "translate"),
-        "synthesis": 1 + (stage == "synthesis"),
+        "translate": 3 + 2 * (stage == "translate"),
+        "synthesis": 1 + 2 * (stage == "synthesis"),
     }
     operation = "translation.body" if stage == "translate" else "polish.body"
     requests = [call for call in client.calls if call["operation"] == operation]
     assert all(call["max_tokens"] is None for call in requests)
-    # The failed stage alone retries, quoting the rejection instead of repeating it.
-    extended = [call for call in requests if len(call["messages"]) > len(failed_messages[0])]
-    assert len(extended) == 1
-    assert extended[0]["messages"][: len(failed_messages[0])] == failed_messages[0]
-    assert extended[0]["messages"][-2]["role"] == "assistant"
-    assert "failed local validation" in extended[0]["messages"][-1]["content"]
+    # Only the failed stage repeats, one segment per request, over the same frozen packet.
+    segments = [
+        segment_ids(json.loads(call["messages"][-1]["content"].split("Task (JSON):\n")[1]))
+        for call in requests
+    ]
+    assert [ids for ids in segments if len(ids) == 1] == [[0], [1]]
+    assert all(call["messages"][:2] == failed_messages[0][:2] for call in requests)
     records = [
         load_precision_call(store, key)
         for key in store.list_artifacts(f"{result.precision_key}/calls/")
         if key.endswith(".json")
     ]
-    assert len(records) == 5
+    assert len(records) == 6
     failed = [record for record in records if record["status"] == "failed"]
     assert len(failed) == 1
     assert failed[0]["error_category"] == "invalid_output"
     assert json.loads(failed[0]["raw_response"]) == {"translations": []}
-    assert sum(record["status"] == "completed" for record in records) == 4
+    assert sum(record["status"] == "completed" for record in records) == 5
     assert executor.execute(_plan(store), store) == result
-    assert len(client.calls) == 5
+    assert len(client.calls) == 6
     usage = client.usage_summary()
-    assert usage["totals"]["calls"] == 5
-    assert usage["totals"]["total_tokens"] == 40
+    assert usage["totals"]["calls"] == 6
+    assert usage["totals"]["total_tokens"] == 48
     assert usage["by_stage"][operation]["calls"] == len(requests)
 
 
@@ -231,7 +237,7 @@ def test_protected_sources_survive_generation_archive_and_resume(tmp_path, bound
 
     def normalize_spaces(messages, tier, json_mode):
         response = json.loads(handler(messages, tier, json_mode))
-        response["translations"][1] = source.replace("\u2005", " ")
+        response["translations"]["1"] = source.replace("\u2005", " ")
         return json.dumps(response)
 
     client = MeteredFakeClient(handler=normalize_spaces)
@@ -260,7 +266,7 @@ def test_protected_sources_survive_generation_archive_and_resume(tmp_path, bound
         record = load_precision_call(store, key)
         assert record["status"] == "completed"
         assert record["targets"][1] == source
-        assert json.loads(record["raw_response"])["translations"][1] == source.replace(
+        assert json.loads(record["raw_response"])["translations"]["1"] == source.replace(
             "\u2005", " "
         )
     assert all(segment.target is None for segment in store.load_chapter(0).text_segments)
@@ -353,3 +359,56 @@ def test_cli_exports_and_resumes_with_four_body_calls(tmp_path, monkeypatch):
         assert result.exit_code == 0, result.output
     assert "润" in output.read_text(encoding="utf-8")
     assert handler.counts == {"translate": 3, "synthesis": 1}
+
+
+def test_extra_and_missing_paragraphs_are_repaired_by_id_without_pausing(tmp_path):
+    sources = tuple(f"paragraph {i}" for i in range(36))
+    store, config, handler = _store(tmp_path, sources), _config(tmp_path), Handler()
+    requested = []
+
+    def misaligned(messages, tier, json_mode):
+        response = json.loads(handler(messages, tier, json_mode))
+        translations = response["translations"]
+        task = json.loads(messages[-1]["content"].split("Task (JSON):\n")[1])
+        requested.append(("drafts" in task, segment_ids(task)))
+        if len(segment_ids(task)) == len(sources):
+            translations["36"] = "surplus"
+            if "drafts" in task:
+                del translations["17"]
+        return json.dumps(response)
+
+    client = MeteredFakeClient(handler=misaligned)
+    result = PrecisionBatchExecutor(client, config).execute(_plan(store), store)
+    assert len(result.targets) == 36 and "surplus" not in result.targets
+    # Drafts with a surplus key whose entries echo their sources need no repair; synthesis
+    # re-requests paragraph 17 and paragraph 16 just before the gap.
+    assert len(client.calls) == 5
+    assert requested[-1] == (True, [16, 17])
+    assert result.targets[15] == "润1:15"
+    assert result.targets[16] == "润2:16" and result.targets[17] == "润2:17"
+
+
+def test_interrupted_synthesis_repair_reuses_completed_drafts(tmp_path):
+    store, config, handler = _store(tmp_path), _config(tmp_path), Handler()
+    interrupt = True
+
+    def drop_then_interrupt(messages, tier, json_mode):
+        response = json.loads(handler(messages, tier, json_mode))
+        task = json.loads(messages[-1]["content"].split("Task (JSON):\n")[1])
+        if "drafts" in task and segment_ids(task) == [0, 1]:
+            del response["translations"]["1"]
+        elif "drafts" in task and interrupt:
+            raise KeyboardInterrupt
+        return json.dumps(response)
+
+    client = MeteredFakeClient(handler=drop_then_interrupt)
+    executor = PrecisionBatchExecutor(client, config)
+    with pytest.raises(KeyboardInterrupt):
+        executor.execute(_plan(store), store)
+    assert handler.counts == {"translate": 3, "synthesis": 2}
+    interrupt = False
+    result = executor.execute(_plan(store), store)
+    # ponytail: mid-stage partial synthesis is not resumed; the stage restarts from its drafts.
+    # Dropping id 1 makes id 0 suspicious too, so both are requested alone after each round.
+    assert handler.counts == {"translate": 3, "synthesis": 5}
+    assert result.targets == ("润4:0", "润5:1")

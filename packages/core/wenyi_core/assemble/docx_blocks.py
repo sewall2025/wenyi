@@ -232,7 +232,7 @@ def _emit_chapter_blocks(
                 c = int(cur_meta.get("col") or 0)
                 rows = max(rows, int(cur_meta.get("rows") or rows))
                 cols = max(cols, int(cur_meta.get("cols") or cols))
-                cells[(r, c)] = (_seg_text(cur), cur.source, cur_meta)
+                cells[(r, c)] = (_seg_text(cur, bilingual=bilingual), cur.source, cur_meta)
                 i += 1
             _flush_table(
                 doc,
@@ -251,7 +251,7 @@ def _emit_chapter_blocks(
             i += 1
             continue
 
-        target_parts = [_seg_text(seg)]
+        target_parts = [_seg_text(seg, bilingual=bilingual)]
         source_parts = [seg.source]
         kind = seg.kind
         heading_level = 1
@@ -264,7 +264,7 @@ def _emit_chapter_blocks(
             nxt_meta = nxt.meta if isinstance(nxt.meta, dict) else {}
             if not nxt.cont or nxt_meta.get("table_id") is not None:
                 break
-            target_parts.append(_seg_text(nxt))
+            target_parts.append(_seg_text(nxt, bilingual=bilingual))
             source_parts.append(nxt.source)
             i += 1
         target = "".join(target_parts)

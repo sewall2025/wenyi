@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -51,6 +52,11 @@ class ModelConfig(BaseModel):
     provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
     max_output_tokens: int | None = Field(default=None, gt=0)
+    # Prompt plus output token limit; local request budgeting only, never route identity.
+    context_window: int | None = Field(default=None, gt=0)
+    # False sends body translation and synthesis one paragraph per plain-text request; a
+    # transport choice like ``stream``, so it stays out of route identity.
+    batch_output: bool = True
     options: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("model", "provider")
@@ -95,6 +101,46 @@ class BudgetConfig(BaseModel):
     deadline_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
+def _migrate_connection_windows(raw: dict[str, Any]) -> dict[str, Any]:
+    """Move the deprecated connection-level ``context_window`` onto referencing models.
+
+    A model's own value wins. The warning names only configuration IDs.
+    """
+    providers = raw.get("providers")
+    if not isinstance(providers, dict) or not any(
+        isinstance(item, dict) and "context_window" in item for item in providers.values()
+    ):
+        return raw
+    windows: dict[str, Any] = {}
+    migrated: dict[str, Any] = {}
+    for name, item in providers.items():
+        if isinstance(item, dict) and "context_window" in item:
+            item = dict(item)
+            window = item.pop("context_window")
+            if window is not None:
+                windows[name] = window
+        migrated[name] = item
+    models = raw.get("models")
+    if isinstance(models, dict):
+        models = {
+            name: (
+                {**item, "context_window": windows[item["provider"]]}
+                if isinstance(item, dict)
+                and item.get("context_window") is None
+                and item.get("provider") in windows
+                else item
+            )
+            for name, item in models.items()
+        }
+    warnings.warn(
+        "llm.providers.<id>.context_window is deprecated; set context_window on each model "
+        f"(migrated from: {', '.join(sorted(windows)) or 'none'})",
+        FutureWarning,
+        stacklevel=2,
+    )
+    return {**raw, "providers": migrated, **({"models": models} if models is not None else {})}
+
+
 class LLMConfig(BaseModel):
     """One routing schema for both presets and fully explicit configurations."""
 
@@ -125,7 +171,7 @@ class LLMConfig(BaseModel):
                 if not isinstance(supplied, dict):
                     raise ValueError(f"llm.{section} must be a mapping")
                 raw[section] = {**defaults[section], **supplied}
-        return raw
+        return _migrate_connection_windows(raw)
 
     @model_validator(mode="after")
     def validate_graph(self) -> LLMConfig:

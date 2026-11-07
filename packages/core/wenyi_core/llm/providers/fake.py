@@ -51,6 +51,16 @@ class FakeClient(LLMClient):
         self.routes = resolve_routes(self.config)
         self.calls: list[dict[str, Any]] = []
 
+    def context_window(self, operation: str) -> int | None:
+        # Learning and calibration only fill in for a model without a configured window.
+        return self.routes[operation].context_window or super().context_window(operation)
+
+    def batch_output(self, operation: str) -> bool:
+        return self.routes[operation].batch_output
+
+    def max_output_tokens(self, operation: str) -> int | None:
+        return self.routes[operation].max_output_tokens
+
     def complete(
         self,
         messages: Messages,
@@ -58,6 +68,7 @@ class FakeClient(LLMClient):
         operation: str,
         json_mode: bool = False,
         max_tokens: int | None = None,
+        json_schema: dict[str, Any] | None = None,
     ) -> str:
         from ..operations import require_operation
         from ..routing import model_route
@@ -81,6 +92,7 @@ class FakeClient(LLMClient):
                 "stage": operation,
                 "tier": tier,
                 "json_mode": json_mode,
+                "json_schema": json_schema,
                 "max_tokens": route.max_output_tokens,
                 "model": route.model,
                 "provider": route.provider,

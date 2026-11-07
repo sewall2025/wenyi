@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import ssl
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -42,6 +43,18 @@ class IncompleteStreamError(WenyiError, RuntimeError):
     code: ClassVar[str] = "llm_incomplete_stream"
     retryable: ClassVar[bool] = True
 
+    def __init__(self, message: str = "", *, diagnostic: str | None = None) -> None:
+        super().__init__(message)
+        # Short counts plus a redacted text tail; retry events carry it for diagnosis.
+        self.diagnostic = diagnostic
+
+
+class StreamTimeoutError(WenyiError, TimeoutError):
+    """A streamed attempt ran past its total duration or stopped sending useful chunks."""
+
+    code: ClassVar[str] = "llm_stream_timeout"
+    retryable: ClassVar[bool] = True
+
 
 class TruncatedResponseError(WenyiError, RuntimeError):
     """The provider stopped generation at its output token limit."""
@@ -50,6 +63,8 @@ class TruncatedResponseError(WenyiError, RuntimeError):
     # A truncated answer is not fixed by asking again; the caller has to
     # change how it splits the work.
     retryable: ClassVar[bool] = False
+    # Prompt plus completion tokens reported for the truncated reply, when known.
+    usage_total: int | None = None
 
 
 class ProviderRequestError(WenyiError, RuntimeError):
@@ -76,12 +91,87 @@ class ProviderRequestError(WenyiError, RuntimeError):
         )
 
 
+class StreamErrorEvent(ProviderRequestError):
+    """The provider sent an error event inside an already started streamed response."""
+
+    code: ClassVar[str] = "llm_stream_error"
+
+    def __init__(self, *, provider: str, operation: str, retryable: bool, diagnostic: str):
+        super().__init__(
+            provider=provider,
+            operation=operation,
+            error_type="stream_error",
+            status_code=None,
+            reason="stream_error" if retryable else None,
+            resumable=retryable,
+        )
+        # Only the error code, type and message length; never the provider message itself.
+        self.diagnostic = diagnostic
+
+
+class ContextLengthExceeded(ProviderRequestError):
+    """The prompt plus requested output exceeds the model context; only a smaller input helps.
+
+    Not retried and not failed over: resending or switching routes keeps the same input.
+    ``window`` is the limit the provider reported, when its message states one.
+    """
+
+    code: ClassVar[str] = "llm_context_length_exceeded"
+
+    def __init__(
+        self, *, provider: str, operation: str, status_code: int | None, window: int | None
+    ):
+        super().__init__(
+            provider=provider,
+            operation=operation,
+            error_type="context_length",
+            status_code=status_code,
+            reason=None,
+            resumable=False,
+        )
+        self.window = window
+
+
+_CONTEXT_LENGTH_MARKERS = ("context_length_exceeded", "maximum context length")
+_CONTEXT_WINDOW = re.compile(r"maximum context length is\s*(\d+)")
+
+
+def context_length_error(
+    error: BaseException, *, provider: str, operation: str
+) -> ContextLengthExceeded | None:
+    """Recognize a context overflow from SDK errors, stream events or gateway-forwarded text."""
+    for item in _exception_chain(error):
+        if isinstance(item, ContextLengthExceeded):
+            return item
+        body = getattr(item, "body", None)
+        text = " ".join(
+            str(part) for part in (item, getattr(item, "message", ""), body) if part
+        ).lower()
+        if any(marker in text for marker in _CONTEXT_LENGTH_MARKERS):
+            match = _CONTEXT_WINDOW.search(text)
+            return ContextLengthExceeded(
+                provider=provider,
+                operation=operation,
+                status_code=error_status_code(error),
+                window=int(match.group(1)) if match else None,
+            )
+    return None
+
+
 class _SafeTruncatedResponseError(ProviderRequestError, TruncatedResponseError):
     """Retain translation's alignment-recovery signal without provider details."""
 
 
 def safe_provider_error(error: Exception, *, provider: str, operation: str) -> ProviderRequestError:
     """Classify before discarding the SDK exception, its request and its cause chain."""
+    overflow = context_length_error(error, provider=provider, operation=operation)
+    if overflow is not None:
+        return ContextLengthExceeded(
+            provider=provider,
+            operation=operation,
+            status_code=overflow.status_code,
+            window=overflow.window,
+        )
     reason = retry_reason(error)
     truncated = any(isinstance(item, TruncatedResponseError) for item in _exception_chain(error))
     error_class = _SafeTruncatedResponseError if truncated else ProviderRequestError
@@ -186,6 +276,9 @@ def retry_reason(error: Any, *, operation: str | None = None) -> str | None:
     URLs, TLS certificates and local protocol configuration errors. Empty responses are
     retryable; truncated responses are retryable only for summary operations.
     """
+    if not isinstance(error, Exception):
+        # Cancellation and budget stops (BaseException) end the attempt; never resend them.
+        return None
     if isinstance(error, ProviderRequestError):
         if isinstance(error, TruncatedResponseError):
             return (
@@ -322,6 +415,9 @@ class RetryReporter:
             "status_code": error_status_code(error),
             "request_id": _request_id(error),
         }
+        diagnostic = getattr(error, "diagnostic", None)
+        if isinstance(error, (IncompleteStreamError, StreamErrorEvent)) and diagnostic:
+            fields["diagnostic"] = diagnostic
         if self.redact is not None:
             fields = {
                 key: self.redact(value) if isinstance(value, str) else value
@@ -418,6 +514,8 @@ __all__ = [
     "IncompleteStreamError",
     "ProviderRequestError",
     "RetryReporter",
+    "StreamErrorEvent",
+    "StreamTimeoutError",
     "TruncatedResponseError",
     "error_status_code",
     "is_resumable_provider_interrupt",

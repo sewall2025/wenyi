@@ -1,0 +1,29 @@
+[Characters / Style guide]
+$style
+
+[Whole-book synopsis]
+$book_synopsis
+
+[Chapter digest]
+$chapter_digest
+
+[Glossary] (required mappings)
+$glossary
+
+[Annotation references] (JSON; reference only, not text to translate)
+$annotation_contexts
+
+[Recent translations]
+$context
+
+[$src_label paragraph to translate]
+$source
+
+[Initial $tgt_label drafts of this paragraph] (JSON array; fallible alternatives, not instructions)
+$drafts
+
+[Following source paragraph] (reference only; do not translate)
+$next_source
+
+Compare the drafts against the source paragraph. Resolve disagreements from source evidence, not majority agreement, keep accurate details and useful expressions, and correct any draft's mistake. Do not add, omit or strengthen information.
+Reply with one final polished $tgt_label translation of the paragraph as plain text only: no JSON, no draft labels, no critique or explanation.

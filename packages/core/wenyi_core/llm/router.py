@@ -18,7 +18,12 @@ from .errors import describe_provider_failure
 from .limits import RequestLimits
 from .operations import require_operation
 from .registry import provider_spec
-from .retrying import is_retryable_provider_error, safe_provider_error
+from .retrying import (
+    ContextLengthExceeded,
+    TruncatedResponseError,
+    is_retryable_provider_error,
+    safe_provider_error,
+)
 from .routing import ResolvedRoute, model_route, resolve_routes
 from .transport import ProviderAdapter, RequestContext
 from .usage import UsageSample
@@ -129,10 +134,17 @@ class RoutedLLMClient(LLMClient):
         operation: str,
         json_mode: bool = False,
         max_tokens: int | None = None,
+        json_schema: dict[str, Any] | None = None,
     ) -> str:
         require_operation(operation)
         primary = self.routes[operation]
-        return self._complete(messages, primary, json_mode=json_mode, max_tokens=max_tokens)
+        return self._complete(
+            messages,
+            primary,
+            json_mode=json_mode,
+            max_tokens=max_tokens,
+            json_schema=json_schema,
+        )
 
     def _complete(
         self,
@@ -141,6 +153,7 @@ class RoutedLLMClient(LLMClient):
         *,
         json_mode: bool,
         max_tokens: int | None = None,
+        json_schema: dict[str, Any] | None = None,
     ) -> str:
         operation = primary.operation
         if max_tokens is not None:
@@ -197,8 +210,13 @@ class RoutedLLMClient(LLMClient):
 
             emit("llm_request_scheduled")
             active_reservation = None
+            reported_total = None
 
             def record(sample: UsageSample | None) -> None:
+                nonlocal reported_total
+                if sample is not None:
+                    reported_total = sample.total_tokens or None
+                    self.calibrate_prompt_tokens(operation, messages, sample.prompt_tokens)
                 if sample is not None and active_reservation is not None:
                     active_reservation.actual_tokens = sample.total_tokens
                 self.usage.record(
@@ -242,6 +260,8 @@ class RoutedLLMClient(LLMClient):
                 attempt_scope,
                 self.limits.wait_for_retry,
                 self._redact,
+                json_schema if json_mode else None,
+                self.limits.track_stream,
             )
             safe_error = None
             try:
@@ -252,6 +272,10 @@ class RoutedLLMClient(LLMClient):
                     context=context,
                 )
             except Exception as error:
+                if isinstance(error, TruncatedResponseError):
+                    error.usage_total = reported_total
+                if isinstance(error, ContextLengthExceeded) and error.window:
+                    self.learn_context_window(operation, error.window)
                 emit(
                     "llm_request_failed",
                     error_type=type(error).__name__,
@@ -265,6 +289,8 @@ class RoutedLLMClient(LLMClient):
                     safe_error = safe_provider_error(
                         error, provider=route.provider_kind, operation=operation
                     )
+                    if isinstance(safe_error, TruncatedResponseError):
+                        safe_error.usage_total = reported_total
                 else:
                     emit("llm_model_failover", next_profile=routes[position + 1].profile)
             else:
@@ -274,6 +300,16 @@ class RoutedLLMClient(LLMClient):
             if safe_error is not None:
                 raise safe_error from None
         raise RuntimeError("No model route was selected")
+
+    def context_window(self, operation: str) -> int | None:
+        # Learning and calibration only fill in for a model without a configured window.
+        return self.routes[operation].context_window or super().context_window(operation)
+
+    def batch_output(self, operation: str) -> bool:
+        return self.routes[operation].batch_output
+
+    def max_output_tokens(self, operation: str) -> int | None:
+        return self.routes[operation].max_output_tokens
 
     def _validate_token_reservation(self, route: ResolvedRoute) -> None:
         connection = self.config.providers[route.provider]

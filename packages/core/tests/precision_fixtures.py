@@ -14,6 +14,11 @@ from wenyi_core.storage.run_store import STATUS_PENDING
 from tests.fake_llm import routing_handler
 
 
+def segment_ids(task):
+    """Requested ids of a precision task; repair requests quote ``{"id", "source"}`` items."""
+    return [item["id"] if isinstance(item, dict) else item for item in task["segments"]]
+
+
 def precision_config(tmp_path: Path) -> Config:
     return Config.from_dict(
         {
@@ -94,13 +99,13 @@ class PrecisionHandler:
             return '{"translations":[]}'
         return json.dumps(
             {
-                "translations": [
-                    source
-                    if not any(character.isalpha() for character in source)
+                "translations": {
+                    str(i): sources[i]
+                    if not any(character.isalpha() for character in sources[i])
                     else ""
                     if self.blank
                     else f"{'润' if kind == 'synthesis' else '译'}{sample}:{i}"
-                    for i, source in enumerate(sources)
-                ]
+                    for i in segment_ids(task)
+                }
             }
         )

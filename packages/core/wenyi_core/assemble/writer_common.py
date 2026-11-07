@@ -8,7 +8,7 @@ import re
 from ..i18n.languages import require_language
 from ..i18n.policy.models import PolicyContext
 from ..i18n.policy.resolver import resolve_policy
-from ..models.document import Chapter, Segment
+from ..models.document import UNTRANSLATED_PLACEHOLDER, Chapter, Segment
 
 _ILLEGAL_FN = re.compile(r'[\\/:*?"<>|\r\n\t]+')
 
@@ -113,8 +113,17 @@ def _export_book_title(
     return f"{base}{suffix}"
 
 
-def _seg_text(seg) -> str:
-    """Return a nonempty translation, falling back to source to prevent content loss."""
+def _seg_text(seg, *, bilingual: bool = False) -> str:
+    """Return the export text for one segment without passing source off as a translation.
+
+    Monolingual output marks a refused segment (``target is None``) with
+    ``UNTRANSLATED_PLACEHOLDER``. Bilingual output returns the source, which the writers'
+    source/target de-duplication then shows exactly once as the original paragraph, so the
+    translation slot stays empty. Sources without letters (numbers, punctuation) are copied
+    by translation anyway, so they and blank saved targets keep the source.
+    """
+    if seg.target is None and not bilingual and any(char.isalpha() for char in seg.source):
+        return UNTRANSLATED_PLACEHOLDER
     return seg.target if (seg.target and seg.target.strip()) else seg.source
 
 
@@ -135,7 +144,9 @@ def _epub_lang(lang: str | None) -> str:
     ).export.language_tag
 
 
-def _merged_paragraphs(chapter: Chapter) -> list[tuple[str, str, str, int]]:
+def _merged_paragraphs(
+    chapter: Chapter, *, bilingual: bool = False
+) -> list[tuple[str, str, str, int]]:
     """Merge continuations while retaining each paragraph's original heading level."""
     paras: list[list[str]] = []  # Translation fragments accumulated for each paragraph.
     srcs: list[list[str]] = []  # Source fragments accumulated for each paragraph.
@@ -145,10 +156,10 @@ def _merged_paragraphs(chapter: Chapter) -> list[tuple[str, str, str, int]]:
         if not s.source.strip():
             continue
         if s.cont and paras:
-            paras[-1].append(_seg_text(s))
+            paras[-1].append(_seg_text(s, bilingual=bilingual))
             srcs[-1].append(s.source)
         else:
-            paras.append([_seg_text(s)])
+            paras.append([_seg_text(s, bilingual=bilingual)])
             srcs.append([s.source])
             kinds.append(s.kind)
             levels.append(_heading_level(chapter, s))

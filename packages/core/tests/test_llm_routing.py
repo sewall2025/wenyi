@@ -610,6 +610,7 @@ def test_inference_fingerprint_ignores_aliases_credentials_and_transport_control
         "timeout": 12,
         "max_retries": 99,
         "max_concurrency": 20,
+        "context_window": 24_576,
     }
     raw["models"]["renamed"] = {**raw["models"].pop("one"), "provider": "renamed"}
     raw["tiers"]["strong"] = raw["tiers"]["fast"] = "renamed"
@@ -622,6 +623,73 @@ def test_inference_fingerprint_ignores_aliases_credentials_and_transport_control
     assert inference_snapshot(before, ("translation.body",)) != inference_snapshot(
         changed, ("translation.body",)
     )
+
+
+def test_context_window_must_be_positive():
+    raw = _graph().model_dump()
+    raw["models"]["one"]["context_window"] = 0
+    with pytest.raises(ValueError, match="context_window"):
+        LLMConfig.model_validate(raw)
+    raw["models"]["one"]["context_window"] = 24_576
+    assert LLMConfig.model_validate(raw).models["one"].context_window == 24_576
+
+
+def test_connection_context_window_migrates_to_models_with_warning():
+    raw = _graph().model_dump()
+    raw["providers"]["a"]["context_window"] = 24_576
+    raw["models"]["three"] = {"provider": "a", "model": "third", "context_window": 8_192}
+    with pytest.warns(FutureWarning, match=r"providers\.<id>\.context_window.*migrated from: a"):
+        cfg = LLMConfig.model_validate(raw)
+    assert "context_window" not in cfg.providers["a"].model_dump()
+    assert cfg.models["one"].context_window == 24_576
+    # The model's own value wins over the deprecated connection value.
+    assert cfg.models["three"].context_window == 8_192
+    assert cfg.models["two"].context_window is None
+
+
+def test_model_window_output_and_batch_output_stay_out_of_identity():
+    before = _graph()
+    raw = before.model_dump()
+    raw["models"]["one"]["context_window"] = 24_576
+    raw["models"]["one"]["batch_output"] = False
+    raw["routes"] = {
+        "translation.body": {"model": "one"},
+        "polish.body": {"model": "one"},
+    }
+    raw["tiers"]["strong"] = raw["tiers"]["fast"] = "two"
+    base = before.model_dump()
+    base["routes"] = raw["routes"]
+    base["tiers"] = raw["tiers"]
+    assert inference_snapshot(LLMConfig.model_validate(base), ("translation.body",)) == (
+        inference_snapshot(LLMConfig.model_validate(raw), ("translation.body",))
+    )
+    raw["models"]["one"]["max_output_tokens"] = 4096
+    assert inference_snapshot(LLMConfig.model_validate(base), ("translation.body",)) == (
+        inference_snapshot(LLMConfig.model_validate(raw), ("translation.body",))
+    )
+
+
+@pytest.mark.parametrize(
+    "routes, message",
+    [
+        ({}, "only supported for translation.body and polish.body"),
+        (
+            {
+                "translation.body": {"model": "two", "fallbacks": ["one"]},
+                "polish.body": {"model": "one"},
+            },
+            "fallback models must not disable batch_output",
+        ),
+    ],
+)
+def test_batch_output_disabled_only_on_plain_text_operations(routes, message):
+    raw = _graph().model_dump()
+    raw["models"]["one"]["batch_output"] = False
+    raw["routes"] = routes
+    if routes:
+        raw["tiers"]["strong"] = raw["tiers"]["fast"] = "two"
+    with pytest.raises(ValueError, match=message):
+        LLMConfig.model_validate(raw)
 
 
 def test_preset_and_operation_override_are_independent():
@@ -661,3 +729,47 @@ def test_route_rejects_ambiguous_selection():
                 }
             }
         )
+
+
+def test_context_overflow_neither_retries_nor_fails_over_and_teaches_the_window(monkeypatch):
+    from wenyi_core.llm.retrying import ContextLengthExceeded
+
+    raw = _graph(routes={"translation.body": {"model": "one", "fallbacks": ["two"]}}).model_dump()
+    raw["providers"]["a"]["max_retries"] = 3
+    client = RoutedLLMClient(LLMConfig.model_validate(raw))
+    calls = []
+
+    def request(self, messages, model, **kw):
+        calls.append(model.model)
+        raise RuntimeError(
+            "上游 400: This model's maximum context length is 24576 tokens. (paramet"
+        )
+
+    monkeypatch.setattr(FakeProvider, "_request", request)
+    with pytest.raises(ContextLengthExceeded) as caught:
+        client.complete([], operation="translation.body")
+    assert calls == ["first"]
+    assert caught.value.window == 24_576
+    assert client.context_window("translation.body") == 24_576
+
+
+def test_reported_prompt_tokens_calibrate_the_local_window_estimate(monkeypatch):
+    from wenyi_core.llm.base import estimate_prompt_tokens
+
+    raw = _graph().model_dump()
+    raw["providers"]["a"]["context_window"] = 1_500
+    client = RoutedLLMClient(LLMConfig.model_validate(raw))
+    messages = [{"role": "user", "content": "lorem ipsum " * 400}]
+    estimate = estimate_prompt_tokens(messages)
+    # 128 reserved output tokens: the estimate alone fits, twice the estimate does not.
+    assert client.fits_context_window("translation.body", messages, source_tokens=0)
+
+    def request(self, messages, model, *, context, **kw):
+        context.record_usage(
+            UsageSample(prompt_tokens=estimate * 2, completion_tokens=1, total_tokens=estimate * 2)
+        )
+        return "ok"
+
+    monkeypatch.setattr(FakeProvider, "_request", request)
+    client.complete(messages, operation="translation.body")
+    assert not client.fits_context_window("translation.body", messages, source_tokens=0)

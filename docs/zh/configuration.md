@@ -38,7 +38,9 @@ ID 以字母开头，只能包含字母、数字、下划线和连字符。被�
 （Desktop 使用内置默认值）；项目设置使用当前全局默认值，保留本项目已保存的翻译方式和语言。
 恢复默认配置也不能删除仍被其他项目选用的模型，需要先调整这些选择。
 步骤下拉框直接显示实际档位，不再加“跟随默认档位”前缀；选回步骤的默认档位会清除
-模型覆盖，并保留已有备用路由。全局保存检查配置版本，过期编辑页需要
+模型覆盖，并保留已有备用路由。**模型与接口**中的每个模型表单有可选的**上下文窗口**
+和**最大输出**（留空表示未知）以及**批量 JSON 输出**开关，对应[配置规则](#配置规则)中的
+模型字段。全局保存检查配置版本，过期编辑页需要
 重新加载再保存。
 
 ## 语言
@@ -129,8 +131,12 @@ llm:
 
 ### 配置规则
 
-- `providers.<id>` 定义连接：`kind`、可选的 `base_url`、`api_key_env`、`timeout`（秒，默认 600）、`max_retries`（额外尝试次数，默认 4）、`max_concurrency`（不设置则不限制）和可选 `quota_group`。
-- `models.<id>` 定义请求配置：`provider` 连接 ID、远端 `model` ID、可选的正数 `max_output_tokens` 和提供商专属 `options`。
+- `providers.<id>` 定义连接：`kind`、可选的 `base_url`、`api_key_env`、`timeout`（秒，默认 600）、`max_retries`（额外尝试次数，默认 4）、`max_concurrency`（不设置则不限制）、可选 `quota_group`。写在连接上的 `context_window` 已弃用：Wenyi 会把它迁移到引用该连接、且自身未设置该值的每个模型上（模型自身的值优先），并给出弃用提示；把它移到模型上即可消除提示。
+- `models.<id>` 定义请求配置：`provider` 连接 ID、远端 `model` ID、可选的正数 `max_output_tokens`、可选的正数 `context_window`、可选的 `batch_output`（默认 `true`）和提供商专属 `options`。
+  - `context_window` 是模型可接受的提示词加输出 token 总数。整批、单段和三选一精翻的翻译请求超出该值时，会在发送前于本地拆分或裁剪。建议填写模型公布的上限，例如 24K 模型填 `24576`；不设置时，Wenyi 只能在 provider 拒绝或截断请求后才学到上限，学到的值只在本次运行内有效。
+  - `max_output_tokens` 会作为请求的输出上限发送（`max_tokens` 或 provider 的等价参数）。上下文窗口预检按该值为回复预留空间；未设置时按原文 token 数的 3 倍预留。
+  - `batch_output: false` 表示不再向该模型发送编号 JSON 整批请求，适合不遵守 JSON 指令的专用翻译模型。标准翻译和三选一精翻的初稿改为逐段请求纯文本，保留原有的裁剪、逐句和拒译兜底。精翻综合阶段使用该模型时同样逐段请求：请求带原文和去重后的各份初稿，只要求输出最终译文。请求次数会更多。只有 `translation.body` 和 `polish.body` 支持该开关；其他操作（包括经档位）路由到该模型会在校验时报错，主模型整批输出时备用模型也必须整批输出。标准模式的润色依赖对齐的 JSON 列表，因此 `polish.body` 使用此类模型时跳过润色，并记录 `polish_skipped` 事件。
+  - `context_window`、`max_output_tokens` 和 `batch_output` 不改变路由身份和续跑状态，修改后已完成的批次、缓存和 Review 证据仍可复用。
 - `tiers` 必须恰好将 `strong`、`cheap`、`fast` 映射到模型配置；不用预设时需完整填写，也可以全部指向同一模型。档位表示偏好，不代表实测质量或价格。
 - `routes.<操作>` 必须且只能选择 `{model: 配置名}` 或 `{tier: strong}`。未知操作、字段及引用在请求前报错，不再隐式回退缺失档位。
 - 覆盖预设时，按 ID 整体替换连接或模型配置，需要重复必填字段；不同模型的 options 不合并。档位和路由按各自键替换。
@@ -153,9 +159,11 @@ llm:
 
 兼容端点的 `reasoning_style` 支持 `none`（默认）、`deepseek`、`openai`、`openrouter`。只有明确配置 `json_response_fallback: reasoning_content`，才会从网关的该字段读取有效 JSON；默认 `none`，非 JSON 推理文本不会被当作结果。Gemini 的 thinking level 和 budget 互斥。原始扩展字典依赖具体端点；离线校验无法保证远端模型接受这些参数。
 
-所有 OpenAI 兼容连接（除 `gemini` 和 `fake` 外的适配器）都接受 `stream: true`（默认）或 `stream: false`。流式请求通过 `stream_options.include_usage` 在最后一个分块获取用量，避免网关把长时间请求当作空闲连接断开。流式下 `timeout` 表示两个分块之间的最长等待时间，而不是整次请求的总时长；总时长用 `budget.deadline_seconds` 限制。不支持 `stream_options` 的旧网关可设 `stream: false`。该开关不影响模型输出，也不改变续跑身份。
+所有 OpenAI 兼容连接（除 `gemini` 和 `fake` 外的适配器）都接受 `stream: true`（默认）或 `stream: false`。流式请求通过 `stream_options.include_usage` 在最后一个分块获取用量，避免网关把长时间请求当作空闲连接断开。流式下 `timeout` 同时限制每次尝试的总时长：超时后 Wenyi 关闭流，并按超时错误重试。若流在 `timeout` 秒与 5 分钟中较短的时长内没有发送任何内容、推理、结束标记或用量，同样关闭并重试，因此 SSE 心跳无法让流一直挂着。长时间的流约每 30 秒记录一条 `llm_stream_progress` 事件，包含分块数和字符数。整次运行的总时长用 `budget.deadline_seconds` 限制。不支持 `stream_options` 的旧网关可设 `stream: false`。该开关不影响模型输出，也不改变续跑身份。
 
-SDK 内置重试统一关闭。Wenyi 统一重试连接/超时、HTTP 408/409/429、5xx 瞬时错误、空响应及未收到结束标记的流式响应（部分内容丢弃）；退避期间释放连接并发名额，并响应取消。普通 4xx 错误不重试。PDF 默认 MinerU 解析另用 `MINERU_API_KEY`；可选 BabelDOC HTTP bridge 独立于模型路由。
+这些连接同样接受 `structured_output: none`（默认）或 `structured_output: json_schema`。设为 `json_schema` 时，携带 schema 的请求（目前为三选一精翻）以 `response_format` 类型 `json_schema` 并 `strict: true` 代替 `json_object`，要求模型只返回本次请求的段落编号。仅在 provider 与模型支持 strict JSON schema 时开启，否则请求会以 provider 错误失败。其他 JSON 请求仍使用 `json_object`。本地输出校验照常执行；该选项不影响路由身份或续跑状态。
+
+SDK 内置重试统一关闭。Wenyi 统一重试连接/超时、HTTP 408/409/429、5xx 瞬时错误、空响应及未收到结束标记的流式响应（部分内容丢弃，但该次尝试已上报的用量照常计入）；JSON 模式下流缺少结束标记、但内容能被严格解析为完整 JSON 时视为正常完成，并记录 `stream_missing_finish_reason` 事件。断流的重试事件附带简短 `diagnostic`（分块数、字符数、是否收到用量及末尾 80 个字符）。已开始的流中途返回错误事件（`data: {"error": ...}`）时按 `stream_error` 重试，`diagnostic` 只记录错误的 `code`、`type` 和消息长度；`code` 或 `type` 为 `context_length_exceeded`、`invalid_request_error` 的错误事件不重试。退避期间释放连接并发名额，并响应取消。普通 4xx 错误不重试。PDF 默认 MinerU 解析另用 `MINERU_API_KEY`；可选 BabelDOC HTTP bridge 独立于模型路由。
 
 总设置中的 **MinerU PDF 解析**卡片独立于模型连接。Web 和 CLI 从部署/进程环境变量
 `MINERU_API_KEY` 读取密钥。Desktop 优先读取同一变量，缺失时使用该卡片手动保存的
@@ -235,9 +243,9 @@ llm:
 
 相同 `quota_group` 的连接在本次运行内共享 RPM/TPM 预留；连接并发限制也覆盖使用它的全部操作。这些控制不协调其他进程，也不能替代服务端的账号配额。Token 控制先按保守的提示词字节估算加显式输出上限预留，再根据返回的实际用量调整；预留量不是实际计费，也不是金额上限。启用 token 限制时，每个可达的主模型和备用模型都必须有有限输出上限。
 
-`deadline_seconds` 和 Ctrl+C 协作式停止排队请求与重试等待；已进入 SDK 的请求仍可能执行到完成或连接超时。完成结果保留供续跑；重新启动会获得一份新的运行预算。
+`deadline_seconds` 和 Ctrl+C 协作式停止排队请求与重试等待。取消（Ctrl+C、Web/Desktop 暂停、Desktop 退出）还会在数秒内关闭正在读取的流式响应，且不会重试；非流式的 SDK 请求仍可能执行到完成或连接超时。完成结果保留供续跑；重新启动会获得一份新的运行预算。
 
-无状态请求可以显式设置 `fallbacks: [备用配置名]`。只有可重试的传输错误耗尽重试后才进入该链；认证、配置及输出结构错误不触发模型切换。可续跑的 `review.verify`、`review.arbitrate`、`autofix.verify` 对话禁止故障切换，避免一条取证轨迹混用模型。
+无状态请求可以显式设置 `fallbacks: [备用配置名]`。Web/Desktop 设置中，每个步骤的模型选择下方有可排序的备用模型列表，可添加、调整顺序或移除已注册模型；不提供该步骤的主模型，也不能重复选择。可续跑的取证会话步骤禁用该列表。只有可重试的传输错误耗尽重试后才进入该链；认证、配置及输出结构错误不触发模型切换。可续跑的 `review.verify`、`review.arbitrate`、`autofix.verify` 对话禁止故障切换，避免一条取证轨迹混用模型。
 
 ### 用量与续跑
 
@@ -305,7 +313,7 @@ pipeline:
 ```
 
 - `review`：默认开启；全书翻译完成时自动执行取证式全书审校。一键流程可用 `--no-review` 或设为 `false` 跳过。仍可显式调用 `wenyi review`。
-- `align_retry_limit`：模型输出结构无效时的额外尝试次数；默认 `2` 表示连同初次请求最多尝试三次，`0` 关闭此类重试。标准翻译耗尽后回退到逐段翻译；精翻的每份初稿和综合润色使用同一预算，仅重试失败阶段并保持上下文不变，耗尽后暂停，不自动拆段。实际请求（包括失败尝试）产生模型用量；网络等传输重试仍独立处理。
+- `align_retry_limit`：模型输出结构无效时的额外尝试次数；默认 `2` 表示连同初次请求最多尝试三次，`0` 关闭此类重试。标准翻译耗尽后回退到逐段翻译；精翻先在上下文不变的前提下只补请求缺失或无效的段落编号；某轮零进展后，剩余段落逐段单独请求并使用此预算，仍失败则暂停批次。实际请求（包括失败尝试）产生模型用量；网络等传输重试仍独立处理。
 - `polish`：翻译后再调用强模型润色，质量可能提升，但显著增加耗时和成本。
 - `rolling_context_tokens`：前文译文预算，使用 tiktoken `cl100k_base` 计数，包含段间换行；默认 `512`，最小为 `0`。从最近译文向前选取预算内连续的完整段落；若最近的非空段落单独就超限，只取该段不破坏 Unicode 字符的尾部。上下文从正式章节译文重建，不再单独持久化缓存；已有 `context.json` 不读取、不改写或删除。此值为零时，翻译与润色仍保留内置后文原文参考。详见[全书理解与上下文](pipeline.md#全书理解与上下文)。
 - 旧键 `rolling_context_segments` 不再接受，请使用 `rolling_context_tokens` 替换，不提供段数到 token 的自动换算。
@@ -331,7 +339,7 @@ pipeline:
 `translate` 命令的 `--polish`、`--no-polish`、`--review`、`--no-review`
 会覆盖对应配置。
 
-正文翻译和新 Reviewer 请求始终使用全量术语表，无范围选择开关。已有 YAML 或项目
+正文翻译只注入每批命中的词条，新 Reviewer 请求使用全量术语表，无范围选择开关。已有 YAML 或项目
 配置中的 `pipeline.glossary_scope` 必须删除；旧键即使取值为 `full` 也会报错。
 快照刷新、续跑行为及提示词大小取舍详见[术语库策略](pipeline.md#术语库)。
 

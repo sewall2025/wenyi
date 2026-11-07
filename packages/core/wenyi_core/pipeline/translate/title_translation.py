@@ -8,9 +8,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from ...agents import prompts
-from ...agents.title_translator import TitleOutputError, TitleTranslator
+from ...agents.title_translator import TitleContextOverflow, TitleOutputError, TitleTranslator
 from ...glossary.store import GlossaryStore
 from ...models.document import Chapter
+from ...models.glossary import GlossaryTerm
 from ...storage.protocol import Storage
 
 
@@ -200,13 +201,11 @@ class TitleTranslationService:
 
         batches = title_batches(plan.pending)
         completed = 0
-        glossary_text = prompts.render_glossary(
-            glossary.all_terms(), source_lang=self._translator.src
-        )
+        terms = glossary.all_terms()
         for batch_index, batch in enumerate(batches):
             titles = [item.source for item in batch]
             try:
-                translated = self._translator.translate(titles, glossary_text)
+                translated = self._translate_fitting(store, batch_index, titles, terms)
             except TitleOutputError as error:
                 store.log_event(
                     "titles_translation_rejected",
@@ -224,7 +223,7 @@ class TitleTranslationService:
                     error=repr(error),
                 )
                 raise
-            plan.apply(batch, translated)
+            plan.apply(batch, translated)  # Empty (kept) titles fall back to the source.
             store.save_manifest(plan.manifest)
             store.log_event(
                 "titles_translated",
@@ -237,3 +236,41 @@ class TitleTranslationService:
             completed += len(batch)
             if progress:
                 progress(completed, len(plan.pending), "Translating chapter titles")
+
+    def _translate_fitting(
+        self, store: Storage, batch_index: int, titles: list[str], terms: list[GlossaryTerm]
+    ) -> list[str]:
+        """Translate titles, halving oversized requests; an unfittable title stays untranslated.
+
+        A single title is retried with only the glossary entries it cites before it is kept
+        as its source text (returned as ``""``), so context overflow never stops the run.
+        """
+        text = prompts.render_glossary(terms, source_lang=self._translator.src)
+        try:
+            return self._translator.translate(titles, text)
+        except TitleContextOverflow as overflow:
+            if len(titles) > 1:
+                half = len(titles) // 2
+                store.log_event(
+                    "titles_batch_split",
+                    batch=batch_index,
+                    count=len(titles),
+                    left_count=half,
+                    right_count=len(titles) - half,
+                    reason="context_length",
+                    trigger=overflow.trigger,
+                )
+                return self._translate_fitting(
+                    store, batch_index, titles[:half], terms
+                ) + self._translate_fitting(store, batch_index, titles[half:], terms)
+            cited = GlossaryStore.terms_in(terms, titles[0])
+            if len(cited) < len(terms):
+                return self._translate_fitting(store, batch_index, titles, cited)
+            store.log_event(
+                "titles_kept_source",
+                batch=batch_index,
+                source=titles[0],
+                reason="context_length",
+                trigger=overflow.trigger,
+            )
+            return [""]

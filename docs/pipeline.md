@@ -60,7 +60,7 @@ The pure `i18n/policy/` resolver separates source and target bindings, exact pai
 
 ## Whole-book understanding and context
 
-The prescan creates a digest for each chapter and a synopsis of the complete book. For every translation batch, the prompt presents stable information first: style guidance, the whole-book synopsis, the current chapter digest, the full current glossary, any source-language notes referenced by the current segments, recent translated context, the source text to translate, and one following source segment. Recent translation therefore remains immediately adjacent to the new source passage.
+The prescan creates a digest for each chapter and a synopsis of the complete book. For every translation batch, the prompt presents stable information first: style guidance, the whole-book synopsis, the current chapter digest, the glossary entries cited by the batch, any source-language notes referenced by the current segments, recent translated context, the source text to translate, and one following source segment. Recent translation therefore remains immediately adjacent to the new source passage.
 
 This lets early chapters benefit from knowledge of later events while helping adjacent batches preserve pronouns, forms of address, tone, and sentences that span multiple source segments.
 
@@ -108,7 +108,7 @@ misclassification. Offline tests do not establish a model-quality improvement.
 
 ## Glossary
 
-Preparation analyzes style and character voices without proposing name translations or extracting glossary entries. As translation proceeds, Wenyi extracts and updates people, places, organizations, terms, techniques, recurring expressions, and forms of address from completed source-and-target pairs. Existing project terms, including imports and earlier automatically seeded entries, remain unchanged by preparation on resume. By default, without imported terms, the first body-translation batch starts with an empty glossary: this avoids locking in sample-based guesses, but gives that batch no predefined terminology mappings. The optional terminology-evidence mode described below can admit discovered candidates before a pending body batch. Every body-translation batch receives the full current glossary, including entries absent from the current chapter. Fresh Reviewer requests share the complete final glossary snapshot across chapters and workers. Entries retain insertion order, and new entries append at the end to preserve stable prompt prefixes. After extraction changes the glossary, translation refreshes its snapshot before the next pending batch; completed batches keep their saved targets. If interruption occurs after targets are saved but before extraction is checkpointed, resume completes extraction before translating the next batch. Checkpointed batches skip both translation and extraction.
+Preparation analyzes style and character voices without proposing name translations or extracting glossary entries. As translation proceeds, Wenyi extracts and updates people, places, organizations, terms, techniques, recurring expressions, and forms of address from completed source-and-target pairs. Existing project terms, including imports and earlier automatically seeded entries, remain unchanged by preparation on resume. By default, without imported terms, the first body-translation batch starts with an empty glossary: this avoids locking in sample-based guesses, but gives that batch no predefined terminology mappings. The optional terminology-evidence mode described below can admit discovered candidates before a pending body batch. Every body-translation request (standard translation, both best-of-three stages, and standalone polishing) receives only the glossary entries whose source form or confirmed alias occurs in the batch's source paragraphs or in their source-language annotations. Matching uses the shared glossary matcher: case- and width-insensitive whole words for Latin, Greek and Cyrillic scripts, substrings for CJK, ruby markers removed, and source-only matching for forms of address, speech patterns and fixed expressions. Recent translated context is target-language text and the following source paragraph is reference only, so neither selects entries. Cited entries keep glossary insertion order, so the same batch and glossary always produce the same prompt and fingerprint. Fresh Reviewer requests share the complete final glossary snapshot across chapters and workers. After extraction changes the glossary, translation refreshes its snapshot before the next pending batch; completed batches keep their saved targets. If interruption occurs after targets are saved but before extraction is checkpointed, resume completes extraction before translating the next batch. Checkpointed batches skip both translation and extraction.
 
 The glossary owns character name mappings. The style brief retains source identities,
 gender, and descriptive character notes, but does not repeat translated names from the
@@ -133,7 +133,7 @@ so older cached work may require fresh model calls; historical artifacts remain 
 This trades inferred reading coverage for less unsupported pronunciation guidance;
 offline tests do not establish model quality.
 
-This policy provides cross-chapter terminology context at the cost of larger prompts and potentially higher token usage. It does not guarantee provider prefix-cache hits or improved translation quality. Selective evidence queries and segment Fixer requests still use relevant terms. `pipeline.glossary_scope` has been removed; configuration containing that key is rejected and must be edited explicitly.
+Cited-entry injection keeps batch prompts proportional to the batch instead of the whole glossary; on a 515-entry book glossary a 31-paragraph batch drops from about 28K glossary tokens to about 0.5K. The selection is fixed (no scope selector): `pipeline.glossary_scope` has been removed, and configuration containing that key is rejected and must be edited explicitly. Upgrading changes the prompt and best-of-three fingerprints of pending batches, so unfinished batches are requested again; completed batches keep their saved targets and are skipped. With `pipeline.terminology_context` enabled, the style prefix still lists every person entry by source form and gender (no translations), unchanged. Glossary consistency checks, conflict arbitration and Review use the full glossary as before.
 
 If analysis, glossary extraction, or historical term alignment returns a collection with an invalid type, Wenyi ignores that collection and logs a warning with the operation, field, and actual type. Arrays retain object members and log the number of discarded non-object members. Missing or null fields and valid empty arrays do not produce collection-shape warnings. These diagnostics use the CLI/worker's standard Python logs, exclude source text and model response content, and help identify missing candidates without interrupting translation.
 
@@ -277,7 +277,7 @@ three independent initial drafts → one comprehensive source-aware polishing �
 final text. Drafts share the frozen system/source/context prefix but have independent
 conversation histories and do not see their siblings. The polishing call uses the
 same prefix plus all three fallible drafts as data, combines their useful parts and
-outputs the final text array directly, preserving the existing document structure.
+outputs the final text for each paragraph id directly, preserving the existing document structure.
 Source, glossary, synopsis, recent context
 and following source remain unchanged.
 
@@ -295,30 +295,111 @@ flowchart TD
 
 The synthesis policy prioritizes the source over draft consensus or fluency; it is
 not an independently verified accuracy guarantee. There is no accuracy judge,
-three-way polishing, blind acceptance, refinement round, per-paragraph competition
-or scoped alignment recovery. Structural validation supports EPUB/DOCX backfill and
-never silently zips away text. Draft and synthesis model-output failures share
-`pipeline.align_retry_limit`: one initial request plus at most N retries (default N=2).
-Malformed JSON, missing or invalid translation arrays/counts/types, forbidden blank
-translations and truncated responses retry only the failing candidate or synthesis.
-Structural failures (wrong shape, count mismatch, wrong types, blank targets) append
-the rejected reply and a corrective instruction restating the exact segment contract,
-because models that merge or drop segments repeat the mistake on identical retries;
-truncated responses retry with unchanged messages because feedback cannot raise an
-output cap. Context and output limits stay unchanged, and there is no automatic
-paragraph splitting or single-paragraph fallback. Provider transport/credential
-failures and storage/recording failures propagate without a nested provider retry loop.
-Exhaustion pauses the batch; completed drafts and paid completed receipts remain
-reusable, and manual resume gives missing stages a new bounded retry budget.
+three-way polishing, blind acceptance, refinement round or per-paragraph competition.
+Structural validation supports EPUB/DOCX backfill and never silently zips away text.
+
+Each request lists the wanted paragraph ids in `task.segments` (positions in the frozen
+batch sources). The first request for a batch lists bare ids; repair rounds and
+one-paragraph requests list `{"id": 21, "source": "<full source paragraph>"}` items,
+because models miscount positions when they only get ids. Context, the chapter digest
+and `next_source` are reference only. The model returns
+`{"translations": {"<id>": "<translation>"}}` without echoing the source. Wenyi checks
+every id separately and leaves an id unresolved when:
+
+- its text is not a string (including old `{"src", "text"}` objects), or is blank unless
+  empty translations are allowed;
+- the key occurs twice in the reply;
+- ids are omitted and it is the highest returned id directly followed by an omitted id,
+  because a reply that stops early often truncates its last entry;
+- several ids share the same normalized text while their normalized sources differ (a
+  repetition loop);
+- with different source and target languages and more than one paragraph requested, its
+  normalized text equals its normalized source (an untranslated copy). A one-paragraph
+  request accepts copies, so names, codes or URLs cannot pause a batch.
+
+Paragraphs without letters are restored from the source and never take part in these
+checks. Unrequested ids (such as a translated `next_source`) are always dropped without
+affecting other entries; a duplicate key only leaves that id unresolved, and omitted ids
+are handled by the gap rule above. A legacy bare array is accepted by position only when
+it is not longer than the request and covers every translatable id; otherwise the whole
+reply is discarded.
+Rejected entries are never written to the result. Unresolved ids, and only those ids, are
+requested again with the same frozen packet plus their quoted sources in the task, so
+prompt-cache prefixes stay stable; synthesis resends only the valid drafts for those ids.
+A request continues on its missing ids while it resolves at least one paragraph. A
+zero-progress, malformed or truncated multi-paragraph request is split into two halves,
+recursively, down to single paragraphs; a truncated request is never resent unchanged
+because asking again cannot raise an output cap. Before sending a multi-paragraph
+request, Wenyi estimates its prompt with cl100k tokens and splits it locally when
+`prompt + reserved output > models.<id>.context_window`. The reserve is the profile's
+`max_output_tokens`, or three times the requested source tokens when unset. Without a
+configured window, a truncated reply that reports prompt plus completion usage teaches
+that total as the operation's window for the rest of the process. A context-length rejection
+(`maximum context length` or `context_length_exceeded`, including gateway-forwarded text)
+becomes `ContextLengthExceeded`: it is not retried, does not fail over, splits a
+multi-paragraph request like a local overflow, and teaches the window stated in the message.
+After each request the router compares reported `prompt_tokens` with the cl100k estimate and
+keeps the largest ratio per operation (at least 1, at most 2) for later estimates; the check
+adds a 5% safety margin. A single paragraph that exceeds the window, by estimate or by
+rejection, drops optional input step by step and logs one `context_trimmed` event per step
+(`operation`, `step`, `trigger` = `context_window` or `context_length`): `next_source`, then
+prior context and chapter digest, then glossary entries the paragraph does not cite;
+synthesis then keeps two drafts and, with one left, adopts the first valid draft. A draft
+paragraph that still does not fit goes to the single-segment fallback. Otherwise a single
+paragraph gets `pipeline.align_retry_limit` bounded retries (default 2) with the
+rejected reply and a correction naming its id; an identical reply ends its retries early.
+Results merge by id into the original positions, so request order cannot reorder
+paragraphs. Provider transport/credential failures and storage/recording failures
+propagate without a nested provider retry loop and pause the batch.
+
+```mermaid
+flowchart TD
+    R["Request pending ids"] --> W{"Estimate over window?"}
+    W -- yes --> H["Split in halves"]
+    W -- no --> S["Send"]
+    S --> A{"Accepted any?"}
+    A -- yes --> M["Merge; request missing ids"]
+    A -- "no / truncated" --> H
+    H --> R
+    M --> R
+    S -. "one id" .-> F["Retry with feedback until limit or identical reply"]
+```
+
+A paragraph that stays unresolved does not stop the workflow:
+
+- a draft that fails a paragraph omits it; the synthesis uses the remaining valid drafts
+  when at least two exist, and a single valid draft is used directly;
+- when synthesis fails a paragraph, the first valid draft in T1, T2, T3 order is used;
+- when no draft is valid, the paragraph goes through the
+  [single-segment fallback](#single-segment-fallback-and-refused-segments);
+- when that also fails, the segment is refused: `target` stays `None`, never the source text.
+
+Each fallback writes a `precision_segment_degraded` event (`chapter`, global `segment`,
+`position`, `stage`, `fallback` = `draft_T1`/`draft_T2`/`draft_T3`/`synthesis`/`standard`/
+`refused`, `reason`; refused entries also carry `tried` and `routes`) and a matching entry in
+the batch's `result.json` `degraded` list. `translate_run_finished` reports
+`precision_degraded_segments`. Provider errors while generating drafts or synthesizing still
+pause the batch, so it resumes from the accepted receipts.
+
+OpenAI-compatible connections can also set `structured_output: json_schema`, which
+sends a strict schema requiring exactly the requested ids, each mapped to a required
+string; local per-id validation still
+applies and remains the fallback when a provider ignores the schema.
+
+Each accepted request is recorded as a receipt before the next one, so an interruption
+inside a stage resumes from the accepted paragraphs and requests only the missing ids,
+provided source, context, policy and model identities are unchanged. Already billed
+calls keep their receipts and usage and are not recharged.
 Each attempt retains its raw response, receipt and actual available usage; failed
 receipts stay failed, without migration or revalidation of historical failures.
 Segments that need no translation, such as numbers, punctuation, empty text and
 whitespace-only text, are copied directly from the source in every draft and the
-synthesis. Generated text at those positions is ignored, including changed spacing
-or blank outputs; array count and string-type checks still apply.
+synthesis and are never requested again. Generated text at those positions is
+ignored, including changed spacing or blank outputs.
 Publication metadata means a structurally valid synthesized result, not a semantic
-acceptance gate. `target_before_polish` stores the first initial draft as a comparison
-reference, not a selected accurate draft; `target` stores the synthesized final text.
+acceptance gate. `target_before_polish` stores the first valid initial draft as a
+comparison reference, not a selected accurate draft; `target` stores the synthesized final
+text or its marked fallback.
 
 Initial drafts always use built-in three-branch concurrency. Web manual proofreading
 can inspect published T1/T2/T3 and the original synthesis as read-only archives;
@@ -362,6 +443,9 @@ Scoped provider events bind retries, fallbacks and known token/cache usage to th
 mixing concurrent drafts. Missing usage/model data remains explicitly unknown, not zero.
 Failed or interrupted calls remain diagnostic records; cache reuse is not recorded as a new
 model invocation. Response text is saved before local output validation.
+When a stage needs repair requests, each completed receipt stores the merged result so far
+(unresolved positions as `null`); only a receipt covering every paragraph counts as the
+stage result, and the stage's `call_ref` names that final call.
 
 This is a replay-data foundation, not a benchmark runner: restoring inputs is deterministic,
 but another model invocation can differ because of sampling or server model revisions.
@@ -376,8 +460,8 @@ automatically pruned because it is useful for future comparison and replay.
 
 Polishing is required. Whole-book Review remains a separate optional workflow.
 A normal body batch uses four model calls
-versus two for standard translation with polishing; structural retries add billed
-attempts. Provider retries and other book tasks are accounted for separately;
+versus two for standard translation with polishing; repair requests for missing
+paragraphs and structural retries add billed attempts. Provider retries and other book tasks are accounted for separately;
 this is **not a fixed 2× cost**. Precision uses the existing
 `translation.body` and `polish.body` routes with the same profiles and provider
 behavior as standard, without precision-specific output-token caps or hints.
@@ -385,6 +469,106 @@ Shared-prefix caching and concurrency
 may reduce latency or input-token costs, but do not remove output costs. No real
 model quality comparison has been performed yet; offline tests validate contracts,
 not a guaranteed quality improvement.
+
+## Single-segment fallback and refused segments
+
+As long as a model still returns text, every paragraph gets a translation and one failing
+paragraph never stops the workflow. Standard and best-of-three modes share the same chain:
+
+```mermaid
+flowchart TD
+    B["Batch JSON translation, or best-of-three synthesis and drafts"] -- "paragraph missing" --> P
+    P["Plain-text single paragraph"] -- "empty, truncated or provider error" --> S
+    S["Translate sentence by sentence, rejoin in order"] -- "any sentence fails" --> X
+    P -. "retryable provider error" .-> R["Router fails over to configured fallbacks"]
+    S -. "retryable provider error" .-> R
+    X["Refused: target stays None"]
+```
+
+- The plain-text request (`segment_translator_system`/`segment_translator_user`) asks for the
+  translation of one paragraph only. Any reply that is not blank after removing an obvious
+  code fence or one outer quote pair is accepted, including a reply identical to the source
+  (names, short lines) or to a previous reply.
+- Batch translation splits an oversized request in halves (`context_trimmed` step `split`),
+  and a single paragraph over the context window first drops `next_source`, prior context
+  with the chapter digest, and uncited glossary entries, as in best-of-three precision.
+- Other requests over the context window (estimated before sending or rejected by the
+  provider) also shrink instead of stopping the run:
+  - Review chunks (`review.scan`) are halved (`review_chunk_split` with
+    `reason=context_length`); a single paragraph is retried with only the glossary entries
+    it cites and is otherwise skipped (`review_chunk_skipped`, `reason=context_length`).
+    The skip is cached, so resume does not resend it, and the Review result lists such
+    paragraphs in `skipped_segments` (`summary.skipped_segment_count`).
+  - Title batches (`translation.title`) are halved (`titles_batch_split`); a single title is
+    retried with only the glossary entries it cites, then keeps its source title
+    (`titles_kept_source`), the existing fallback for an empty title translation.
+  - Historical glossary alignment (`glossary.align_history`) halves its candidates; a
+    single candidate that still does not fit stays deferred
+    (`glossary_history_alignment_trimmed`).
+  - Terminology discovery keeps only cited existing entries, then halves passages; one
+    passage that still does not fit discovers nothing. Evidence or merge requests that do
+    not fit leave the person unresolved. Each step logs `terminology_request_trimmed`.
+  - Polishing, chapter digests, the book synopsis, glossary extraction, annotation
+    alignment, Review fixing and arbitration, and Autofix verification already degrade on
+    any non-resumable provider error (keep drafts, empty summary, no entries, unresolved
+    suggestion or unchanged target).
+- If that fails with an empty reply, truncation or a provider error and the paragraph has
+  several sentences, each sentence is translated on its own (Chinese, English and Japanese
+  terminators, closing quotes and ellipses stay with their sentence) and rejoined without
+  spaces for Chinese/Japanese targets and with one space otherwise. If any sentence still
+  fails, nothing is written for the paragraph. Accepted sentences are not checkpointed.
+- Fallback routes (`llm.routes."translation.body".fallbacks`) are tried by the router only
+  for retryable provider errors (connection, 5xx, 429, empty or broken streams). An
+  accepted-but-unusable reply does not switch routes.
+- A segment that fails every step is refused: `target` stays `None`, a
+  `segment_translation_refused` event records `chapter`, `segment`, `tried` (fallback steps),
+  `routes` and `reason`, and the `translation/refused.json` artifact lists every refused
+  segment. `translate_run_finished` reports `refused_segments` and `refused`.
+- A chapter whose only gaps are refused segments is marked `done` and logs
+  `chapter_translated_with_gaps`; chapter glossary extraction uses its translated segments.
+  Whole-book Review skips refused segments and lists them in a `review_untranslated_segments`
+  event.
+- Export never substitutes the source: monolingual TXT/MD/HTML/EPUB/DOCX write
+  `[untranslated]`, BabelDOC PDF fillback writes the same marker, and bilingual output shows
+  the source paragraph once with the translation left empty. Segments without letters
+  (numbers, symbols) still copy their source.
+- To retranslate refused segments, change the model or route and run translation again
+  (`wenyi translate`, `run`, or Web/Desktop continue translation; a finished chapter with gaps
+  can also be translated again). Every segment whose `target is None` is requested again,
+  even in finished chapters; saved translations are not rebought. Successful segments emit
+  `segment_translation_recovered` and are removed from `translation/refused.json`.
+
+The run stops instead of refusing when `SERVICE_UNAVAILABLE_AFTER` (3) consecutive segments
+fail with provider errors on every route (`TranslationServiceUnavailable`), on
+authentication, permission, missing model or insufficient balance errors, on budget limits or
+cancellation, and on storage, source or configuration errors. Content-filter style `400`
+rejections, truncation and context-length rejections count as refusals, not outages; a
+paragraph whose sentences still exceed the window is refused with reason `context_length`. The consecutive-failure rule is a
+heuristic: a long run of moderated paragraphs that come back as provider errors can stop the
+run early, and an intermittent outage can still refuse a few segments; rerunning translation
+fills them in.
+
+### Per-paragraph mode (`batch_output: false`)
+
+A model with `batch_output: false` never receives numbered JSON batches. When
+`translation.body` uses it, standard translation sends each pending paragraph through the
+single-segment chain above directly, and best-of-three drafts do the same for every draft. When
+`polish.body` uses it, best-of-three synthesis sends one plain-text request per paragraph with
+the source and the distinct drafts, and accepts only the final translation; an over-window
+paragraph drops `next_source`, then context and digest, then uncited glossary entries, and an
+unresolved one adopts the first valid draft. Each accepted precision paragraph is recorded as
+its own call receipt, so a resumed run skips it and does not pay for it again. Standard-mode
+polishing is skipped with a `polish_skipped` event because it needs aligned JSON lists.
+Results always merge into the original paragraph order.
+
+### Stream time limits and cancellation
+
+Each streamed attempt is bounded by the connection `timeout` in total, and by an idle limit
+that only content, reasoning, finish reasons or usage reset (the shorter of `timeout` and 5
+minutes). Hitting either closes the stream and retries the attempt as a timeout. Cancellation
+(Ctrl+C, pause, Desktop shutdown) closes every open stream within seconds, raises the
+cancellation error without retrying, and lets the concurrent best-of-three drafts finish.
+Long streams log `llm_stream_progress` events about every 30 seconds.
 
 ## Resumability
 

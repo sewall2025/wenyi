@@ -2510,7 +2510,7 @@ class TestReviewReporting(unittest.TestCase):
         self.assertEqual(result["review_result"]["termination"], "cycle_detected")
 
 
-class TestFullGlossary(unittest.TestCase):
+class TestCitedGlossary(unittest.TestCase):
     def _run_with_terms(self, d):
         from wenyi_core.glossary.store import GlossaryStore, GlossaryTerm
 
@@ -2537,14 +2537,19 @@ class TestFullGlossary(unittest.TestCase):
             if "literary translator" in c["messages"][0]["content"]
         ]
 
-    def test_every_translation_batch_keeps_absent_terms_and_aliases(self):
+    def test_translation_batches_inject_only_cited_terms_and_alias_hits(self):
         with tempfile.TemporaryDirectory() as d:
             translate_prompts = self._run_with_terms(d)
             self.assertTrue(translate_prompts)
+            alias_hits = 0
             for p in translate_prompts:
-                self.assertIn("外部人物X", p)
-                self.assertIn("無関係用語", p)
-                self.assertIn("ホリキタ", p)
+                self.assertNotIn("外部人物X", p)
+                self.assertNotIn("無関係用語", p)
+                batch = p.split("paragraphs to translate]", 1)[1].split("[Following", 1)[0]
+                cited = "堀北" in batch
+                self.assertEqual("ホリキタ" in p, cited)
+                alias_hits += cited
+            self.assertGreater(alias_hits, 0)
 
     def test_batch_glossary_refreshes_following_prompts(self):
         """Extract terms after each batch so later prompts immediately receive new forms of

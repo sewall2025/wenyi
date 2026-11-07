@@ -24,7 +24,7 @@ def _assemble_plain_text(
     for c in m["chapters"]:
         ch = store.load_chapter(c["index"])
         blocks: list[str] = []
-        for kind, target, source, level in _merged_paragraphs(ch):
+        for kind, target, source, level in _merged_paragraphs(ch, bilingual=bilingual):
             if kind == KIND_HEADING and markdown:
                 target = "#" * min(level, 6) + " " + target
             src = _bilingual_source(source, target) if (bilingual and kind != KIND_HEADING) else ""

@@ -270,3 +270,29 @@ def test_prepare_batch_defers_uncertain_terms_without_touching_saved_targets(tmp
     )
     assert client.calls == []
     assert store.load_chapter(0).segments[0].target == "Earlier saved translation 爱丽丝"
+
+
+def test_oversized_history_alignment_is_halved_then_deferred(tmp_path):
+    from wenyi_core.llm.retrying import ContextLengthExceeded
+
+    store, _ = book_store(tmp_path)
+    terms, occurrences = candidates()
+
+    def handler(messages, tier, json_mode):
+        user = messages[-1]["content"]
+        if "PRIVATE_Carl" in user:  # Too long on its own and with Alice.
+            raise ContextLengthExceeded(
+                provider="fake", operation="glossary.align_history", status_code=400, window=None
+            )
+        return json.dumps({"terms": [{"source": terms[0].source, "target": "历史译法"}]})
+
+    client = FakeClient(handler=handler)
+    agent = GlossaryExtractor(client, Config(source_lang="en", target_lang="zh"))
+    result, aligned, deferred = agent._align_with_first_occurrences(terms, occurrences, store=store)
+    assert [term.source for term in result] == [terms[0].source, "New"]
+    assert (aligned, deferred) == (1, 1)
+    trims = store.list_events(event_type="glossary_history_alignment_trimmed")
+    assert [(event["candidate_count"], event["step"]) for event in trims] == [
+        (2, "split"),
+        (1, "defer"),
+    ]

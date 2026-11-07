@@ -57,6 +57,8 @@ def _render_paragraph_html(
 
 def _segment_render_maps(
     segments: list[Segment],
+    *,
+    bilingual: bool = False,
 ) -> tuple[
     dict[str, str],
     dict[str, str],
@@ -73,11 +75,11 @@ def _segment_render_maps(
     current_anchor: str | None = None
     for segment in segments:
         if segment.cont and current_anchor is not None:
-            by_anchor[current_anchor] += _seg_text(segment)
+            by_anchor[current_anchor] += _seg_text(segment, bilingual=bilingual)
             src_by_anchor[current_anchor] += segment.source
         elif segment.anchor:
             current_anchor = segment.anchor
-            by_anchor[current_anchor] = _seg_text(segment)
+            by_anchor[current_anchor] = _seg_text(segment, bilingual=bilingual)
             src_by_anchor[current_anchor] = segment.source
             kind_by_anchor[current_anchor] = segment.kind
             stored_meta_by_anchor[current_anchor] = segment.meta
@@ -112,7 +114,9 @@ def _render_segments_html(
     retain tn-source only as a structural marker.
     """
     soup = BeautifulSoup(template, "html.parser")
-    by_anchor, src_by_anchor, kind_by_anchor, stored_meta_by_anchor = _segment_render_maps(segments)
+    by_anchor, src_by_anchor, kind_by_anchor, stored_meta_by_anchor = _segment_render_maps(
+        segments, bilingual=bilingual
+    )
     # Index once so anchor lookups are O(1), avoiding a full DOM scan with soup.find for every anchor.
     # Reuse the resulting index throughout this resource.
     occupied_ids, tn_id_index = _index_soup_ids(soup)

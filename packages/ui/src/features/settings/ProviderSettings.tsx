@@ -281,11 +281,91 @@ export function ProviderSettings({
                 }
                 onChange={(value) => update("models", id, { model: value })}
               />
+              {(["context_window", "max_output_tokens"] as const).map((field) => (
+                <TokenLimitField
+                  key={field}
+                  id={`${field}-${id}`}
+                  label={tr(
+                    field === "context_window"
+                      ? "providerSettings.contextWindow"
+                      : "providerSettings.maxOutputTokens",
+                  )}
+                  value={model[field]}
+                  onChange={(value) => update("models", id, { [field]: value })}
+                />
+              ))}
+              <div className="min-w-0 space-y-1">
+                <label className="flex items-center gap-2 pt-6 text-sm">
+                  <input
+                    id={`batch_output-${id}`}
+                    type="checkbox"
+                    aria-describedby={`batch-output-${id}-help`}
+                    checked={model.batch_output !== false}
+                    onChange={(e) =>
+                      // Omit the default so saved documents stay unchanged until the switch is used.
+                      update("models", id, { batch_output: e.target.checked ? undefined : false })
+                    }
+                  />
+                  {tr("providerSettings.batchOutput")}
+                </label>
+                <p
+                  id={`batch-output-${id}-help`}
+                  className="text-xs text-muted-foreground"
+                >
+                  {tr("providerSettings.batchOutputHelp")}
+                </p>
+              </div>
             </div>
           );
         })}
       </div>
       <ModelConnectivity saved={saved} disabled={disabled} />
     </fieldset>
+  );
+}
+
+/** Optional positive token count; an empty input means the limit is unknown. */
+function TokenLimitField({
+  id,
+  label,
+  value,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: unknown;
+  onChange: (value: number | undefined) => void;
+}) {
+  const { t: tr } = useI18n();
+  const [draft, setDraft] = useState(value == null ? "" : String(value));
+  useEffect(() => setDraft(value == null ? "" : String(value)), [value]);
+  const number = Number(draft);
+  const invalid = draft.trim() !== "" && !(Number.isInteger(number) && number > 0);
+  return (
+    <div className="min-w-0 space-y-2">
+      <Label htmlFor={id}>{label}</Label>
+      <Input
+        id={id}
+        type="number"
+        min={1}
+        step={1}
+        inputMode="numeric"
+        placeholder={tr("providerSettings.unknownLimit")}
+        value={draft}
+        aria-invalid={invalid}
+        aria-describedby={invalid ? `${id}-error` : undefined}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          // Invalid numbers still reach the draft so saving names the field instead of
+          // silently keeping the previous limit.
+          onChange(e.target.value.trim() === "" ? undefined : Number(e.target.value));
+        }}
+      />
+      {invalid && (
+        <p id={`${id}-error`} role="alert" className="text-sm text-destructive">
+          {tr("providerSettings.positiveInteger")}
+        </p>
+      )}
+    </div>
   );
 }

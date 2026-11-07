@@ -56,8 +56,8 @@ class PrecisionRecords:
         operation: str,
         messages: Messages,
         invoke: Callable[[], str],
-        validate: Callable[[str], list[str]],
-    ) -> tuple[list[str], str]:
+        validate: Callable[[str], list[str | None]],
+    ) -> tuple[list[str | None], str]:
         key = f"{self.key}/calls/{stage}/{uuid4().hex}.json"
         with self.store.state_lock():
             snapshot = self.client.request_snapshot(operation)
@@ -76,7 +76,7 @@ class PrecisionRecords:
                 "effective_model_ref": model_ref,
                 "effective_model_known": model_ref is not None,
                 "messages": self.archive.messages(messages, self.glossary_ref),
-                "json_mode": True,
+                "json_mode": self.client.batch_output(operation),
                 "max_tokens": None,
             }
             self.save(key, record)
@@ -151,8 +151,19 @@ class PrecisionRecords:
         self.store.write_artifact(key, {**record, "record_hash": identity(record)})
 
     def completed(self, stage: str) -> tuple[list[str], str] | None:
-        """Recover paid outputs whose stage binding was interrupted after receipt completion."""
-        completed: list[tuple[str, str, list[str]]] = []
+        """Recover paid outputs whose stage binding was interrupted after receipt completion.
+
+        Partial re-requests record the stage's merged targets with ``None`` for unresolved
+        segments; only a receipt without gaps is a complete stage result.
+        """
+        return self._latest(stage, complete=True)
+
+    def progress(self, stage: str) -> tuple[list[str | None], str] | None:
+        """Return the latest completed receipt's merged targets, gaps included, for resume."""
+        return self._latest(stage, complete=False)
+
+    def _latest(self, stage: str, *, complete: bool) -> tuple[list[Any], str] | None:
+        completed: list[tuple[str, str, list[Any]]] = []
         for key in self.store.list_artifacts(f"{self.key}/calls/{stage}/"):
             record = self.store.read_artifact(key)
             if not isinstance(record, dict):
@@ -166,11 +177,16 @@ class PrecisionRecords:
                 continue
             restored = load_precision_call(self.store, key)
             targets = restored.get("targets")
-            if not isinstance(targets, list) or any(not isinstance(text, str) for text in targets):
+            if not isinstance(targets, list) or any(
+                text is not None and not isinstance(text, str) for text in targets
+            ):
                 raise ValueError("Invalid completed precision output")
+            if complete and None in targets:
+                continue
             completed.append((record["finished_at"], key, targets))
         if not completed:
             return None
+        # Sequential requests within a stage only add segments, so the latest receipt holds them all.
         _time, key, targets = max(completed, key=lambda item: (item[0], item[1]))
         return targets, key
 

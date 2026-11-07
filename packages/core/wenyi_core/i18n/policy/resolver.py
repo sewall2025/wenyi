@@ -32,6 +32,7 @@ TASK_GROUPS = {
         "glossary_extractor",
         "glossary_history",
         "annotation_aligner",
+        "segment_translator",
     ),
     "review": ("reviewer", "review_agent", "review_arbiter", "review_fixer"),
 }
@@ -325,6 +326,7 @@ def resolve_policy(
             "translator_system",
             "review_fixer_system",
             "precision_generation_system",
+            "segment_translator_system",
         }
         for task, _ in templates
     ):

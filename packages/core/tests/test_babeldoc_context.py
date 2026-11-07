@@ -455,7 +455,13 @@ def test_alignment_fallback_and_polish_cannot_reintroduce_layout_neighbors(store
 
     def handler(messages, tier, json_mode):
         user = messages[-1]["content"]
-        if "literary translator" in messages[0]["content"]:
+        if "translating one" in messages[0]["content"]:
+            source = user.split("paragraph to translate]\n", 1)[1].split("\n\n", 1)[0]
+            reference = user.split(
+                "[Following source paragraph] (reference only; do not translate)\n", 1
+            )[1].split("\n\n", 1)[0]
+            references.append(([source], reference))
+        elif "literary translator" in messages[0]["content"]:
             sources = re.findall(r"^\[\d+\] (.*)$", user, flags=re.MULTILINE)
             if "Polish the translations from your previous JSON response" not in user:
                 reference = user.split(

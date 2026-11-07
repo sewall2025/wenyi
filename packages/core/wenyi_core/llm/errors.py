@@ -8,8 +8,10 @@ from typing import Any
 
 from .json_parser import JsonParseError
 from .retrying import (
+    ContextLengthExceeded,
     EmptyResponseError,
     IncompleteStreamError,
+    StreamErrorEvent,
     TruncatedResponseError,
     error_status_code,
     retry_reason,
@@ -58,14 +60,28 @@ _RESPONSE_FAILURES = (
         "incomplete_stream",
         "The provider stream ended before the response finished.",
     ),
+    (StreamErrorEvent, "stream_error", "The provider reported an error during streaming."),
     (JsonParseError, "invalid_json", "The provider response was not valid JSON."),
     (json.JSONDecodeError, "invalid_json", "The provider response was not valid JSON."),
 )
 
 
+def _chain(error: BaseException) -> list[BaseException]:
+    items: list[BaseException] = []
+    current: BaseException | None = error
+    while current is not None and all(current is not item for item in items):
+        items.append(current)
+        current = current.__cause__ or current.__context__
+    return items
+
+
 def describe_provider_failure(error: BaseException) -> ProviderFailure:
     """Normalize known failures without inspecting or copying raw error messages."""
     status = error_status_code(error)
+    if any(isinstance(item, ContextLengthExceeded) for item in _chain(error)):
+        return ProviderFailure(
+            status, "context_length", "The request exceeded the model context window."
+        )
     if status in _HTTP_FAILURES:
         category, message = _HTTP_FAILURES[status]
         return ProviderFailure(status, category, message)

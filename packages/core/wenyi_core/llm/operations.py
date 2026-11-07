@@ -27,6 +27,8 @@ class OperationSpec:
     review: bool = False
     resumable_conversation: bool = False
     protocol_version: int = 1
+    # Supports models with ``batch_output: false`` through one plain-text request per paragraph.
+    plain_text: bool = False
 
 
 def register_operations(specs: Iterable[OperationSpec]) -> Mapping[str, OperationSpec]:
@@ -87,7 +89,11 @@ OPERATIONS = register_operations(
             flags=("book_understanding",),
         ),
         OperationSpec(
-            "translation.body", "Translate body paragraphs", "strong", protocol_version=2
+            "translation.body",
+            "Translate body paragraphs",
+            "strong",
+            protocol_version=2,
+            plain_text=True,
         ),
         OperationSpec("translation.title", "Translate chapter and TOC titles", "strong"),
         OperationSpec(
@@ -96,6 +102,7 @@ OPERATIONS = register_operations(
             "strong",
             flags=("polish",),
             protocol_version=2,
+            plain_text=True,
         ),
         OperationSpec("glossary.extract", "Extract glossary candidates", "fast"),
         OperationSpec("glossary.align_history", "Align terms with earlier translations", "fast"),

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import socket
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Condition, Event
+from typing import Any
 
 from .configuration import LLMConfig
 
@@ -18,6 +20,27 @@ class RequestStopped(BaseException):
 
 class RequestCancelled(RequestStopped):
     """Stop cooperatively at the caller's request, without reporting a failure."""
+
+
+_CANCELLED = "Model requests cancelled; completed work remains resumable"
+
+
+def interrupt_stream(stream: Any) -> None:
+    """Wake a reader blocked on ``stream`` from another thread; the reader closes it.
+
+    ``httpx`` serializes close() with a blocked read, so a real response is unblocked by
+    shutting its socket down; other stream objects are closed directly.
+    """
+    try:
+        response = getattr(stream, "response", None)
+        network = getattr(response, "extensions", {}).get("network_stream")
+        sock = network.get_extra_info("socket") if network is not None else None
+        if sock is not None:
+            sock.shutdown(socket.SHUT_RDWR)
+        else:
+            stream.close()
+    except Exception:  # Best effort; the reader reports the outcome.
+        pass
 
 
 @dataclass
@@ -40,15 +63,40 @@ class RequestLimits:
         self._windows: dict[str, deque[Reservation]] = defaultdict(deque)
         self.requests = 0
         self.reserved_tokens = 0
+        self._streams: dict[int, Any] = {}
 
     def cancel(self) -> None:
         self.cancelled.set()
         with self._condition:
+            streams = list(self._streams.values())
             self._condition.notify_all()
+        # A blocked stream read never sees the event; closing the response wakes it up.
+        for stream in streams:
+            interrupt_stream(stream)
+
+    @contextmanager
+    def track_stream(self, stream: Any) -> Iterator[Any]:
+        """Keep ``stream`` closable by :meth:`cancel` while it is read; raise the cancellation."""
+        with self._condition:
+            self._streams[id(stream)] = stream
+        try:
+            if self.cancelled.is_set():
+                interrupt_stream(stream)
+            yield stream
+        except Exception as error:
+            if self.cancelled.is_set():
+                raise RequestCancelled(_CANCELLED) from error
+            raise
+        finally:
+            with self._condition:
+                self._streams.pop(id(stream), None)
+        # A closed stream may simply end; its partial text is never a complete answer.
+        if self.cancelled.is_set():
+            raise RequestCancelled(_CANCELLED)
 
     def check(self) -> None:
         if self.cancelled.is_set():
-            raise RequestCancelled("Model requests cancelled; completed work remains resumable")
+            raise RequestCancelled(_CANCELLED)
         deadline = self.config.budget.deadline_seconds
         if deadline is not None and self.clock() - self.started >= deadline:
             raise RequestStopped("Model request deadline reached; resume with a new deadline")

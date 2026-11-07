@@ -17,7 +17,9 @@ from ..glossary.evidence_models import (
     SourcePassage,
 )
 from ..glossary.store import GlossaryTerm, _match_text, source_matches_text
+from ..ingest.tokens import count_tokens
 from ..llm.json_parser import JsonParseError
+from ..llm.retrying import ContextLengthExceeded
 from .base import Agent
 
 # Only bounded prose crosses recursive merge boundaries; ledgers stay local.
@@ -82,6 +84,15 @@ def _knowledge_field(location: tuple[str | int, ...]) -> str:
         if isinstance(rest[0], int):
             field += f"[{rest.pop(0)}]"
     return field + (".<extra>" if rest else "")
+
+
+class TerminologyContextOverflow(WenyiError):
+    """A terminology request cannot fit the model context; ``trigger`` names the detector."""
+
+    def __init__(self, task: str, trigger: str):
+        self.task = task
+        self.trigger = trigger
+        super().__init__(f"Terminology {task} request exceeds the model context ({trigger})")
 
 
 class TerminologyKnowledgeError(WenyiError, ValueError):
@@ -263,15 +274,17 @@ class TerminologyAgent(Agent):
             }
         if task == "merge" and len(_json(payload)) > MERGE_INPUT_BUDGET:
             raise ValueError("Terminology merge input exceeds budget; group results before merging")
+        system = self.render(f"terminology_{task}_system")
+        user = self.render(f"terminology_{task}_user", payload=_json(payload))
+        operation = f"terminology.{task}"
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        source_tokens = count_tokens(_json(payload.get("passages", "")))
+        if not self.client.fits_context_window(operation, messages, source_tokens=source_tokens):
+            raise TerminologyContextOverflow(task, "context_window")
         try:
-            return self._ask_json(
-                self.render(f"terminology_{task}_system"),
-                self.render(
-                    f"terminology_{task}_user",
-                    payload=_json(payload),
-                ),
-                operation=f"terminology.{task}",
-            )
+            return self._ask_json(system, user, operation=operation)
+        except ContextLengthExceeded:
+            raise TerminologyContextOverflow(task, "context_length") from None
         except JsonParseError:
             raise ValueError("Invalid terminology JSON response") from None
 

@@ -8,8 +8,9 @@ from threading import Lock
 from typing import Any
 
 from ...agents.review_loop import ReviewAgentLoop
-from ...agents.reviewer import Reviewer, ReviewOutputError
+from ...agents.reviewer import ReviewContextOverflow, Reviewer, ReviewOutputError
 from ...config import Config
+from ...glossary.store import GlossaryStore
 from ...ingest.tokens import count_tokens
 from ...llm.base import LLMClient
 from ...models.glossary import GlossaryTerm
@@ -26,6 +27,7 @@ _EVENT_ORDER = {
     "review_singleton_retry": 1,
     "review_singleton_recovered": 2,
     "review_singleton_failed": 2,
+    "review_chunk_skipped": 2,
     "review_leaf_finished": 3,
 }
 
@@ -74,19 +76,29 @@ class ReviewChunkService:
         Supply the full glossary to every fresh reviewer request and share the same
         snapshot across workers. Completed chunks and initial traces bypass model calls.
         Read fixed target/glossary snapshots. Recursively bisect malformed output and retry
-        single paragraphs a bounded number of times. Merge results in original block order
-        for determinism.
+        single paragraphs a bounded number of times. Requests that exceed the model context
+        are bisected too; a single paragraph is retried with only the glossary entries it
+        cites and is otherwise skipped (``review_chunk_skipped``) so the run continues.
+        Merge results in original block order for determinism.
         """
         budget = self._config.segment.max_tokens_per_batch * 3
-        chunks = self.pack_contiguous(text_segs, budget)
-        if not chunks:
-            return []
-
+        # Refused segments (``target is None``) have nothing to review: pack only the translated
+        # runs around them, keeping chapter-local offsets.
         jobs: list[tuple[int, list]] = []
-        base = 0
-        for chunk in chunks:
-            jobs.append((base, chunk))
-            base += len(chunk)
+        run_start = 0
+        for position in range(len(text_segs) + 1):
+            if position < len(text_segs) and text_segs[position].target is not None:
+                continue
+            base = run_start
+            for chunk in self.pack_contiguous(text_segs[run_start:position], budget):
+                jobs.append((base, chunk))
+                base += len(chunk)
+            run_start = position + 1
+        skipped = len(text_segs) - sum(len(chunk) for _, chunk in jobs)
+        if skipped and on_chunk_finished:
+            on_chunk_finished(skipped)
+        if not jobs:
+            return []
 
         buffered_events: list[dict[str, Any]] = []
         buffer_lock = Lock()
@@ -101,7 +113,17 @@ class ReviewChunkService:
             with buffer_lock:
                 buffered_events.append({"event": event, **data})
 
-        def review_once(chunk_base: int, chunk: list, *, attempt: int = 1) -> list[dict]:
+        def chunk_key(chunk_base: int, count: int) -> str:
+            round_prefix = f"r{review_round}-" if review_round is not None else ""
+            return f"{round_prefix}ch{chapter_index}-base{chunk_base}-n{count}"
+
+        def review_once(
+            chunk_base: int,
+            chunk: list,
+            *,
+            attempt: int = 1,
+            glossary: list[GlossaryTerm] | None = None,
+        ) -> list[dict]:
             """Run one review call and map valid block-local indices to chapter indices."""
             srcs = [s.source for s in chunk]
             overrides = target_overrides or {}
@@ -121,7 +143,7 @@ class ReviewChunkService:
 
             # Check the chunk cache to skip reviewer and evidence-loop model calls on resume.
             round_prefix = f"r{review_round}-" if review_round is not None else ""
-            chunk_id = f"{round_prefix}ch{chapter_index}-base{chunk_base}-n{len(chunk)}"
+            chunk_id = chunk_key(chunk_base, len(chunk))
             if debug is not None:
                 cached = debug.load_chunk_result(chunk_id)
                 if cached is not None:
@@ -223,7 +245,7 @@ class ReviewChunkService:
                     review_result = self._reviewer.review_result(
                         srcs,
                         tgts,
-                        terms,
+                        terms if glossary is None else glossary,
                         trace=trace if debug is not None else None,
                     )
                 except Exception as error:
@@ -339,6 +361,8 @@ class ReviewChunkService:
             """
             try:
                 return review_once(chunk_base, chunk)
+            except ReviewContextOverflow as overflow:
+                return review_oversized(chunk_base, chunk, overflow)
             except ReviewOutputError as error:
                 if len(chunk) > 1:
                     mid = len(chunk) // 2
@@ -385,6 +409,57 @@ class ReviewChunkService:
                     reason=last_error.reason,
                 )
                 raise last_error
+
+        def review_oversized(
+            chunk_base: int, chunk: list, overflow: ReviewContextOverflow
+        ) -> list[dict]:
+            """Shrink a request that exceeds the model context; never stop the Review run."""
+            if len(chunk) > 1:
+                mid = len(chunk) // 2
+                buffer_event(
+                    "review_chunk_split",
+                    start_index=chunk_base,
+                    count=len(chunk),
+                    left_count=mid,
+                    right_count=len(chunk) - mid,
+                    reason="context_length",
+                    trigger=overflow.trigger,
+                )
+                return review_adaptive(chunk_base, chunk[:mid]) + review_adaptive(
+                    chunk_base + mid, chunk[mid:]
+                )
+            cited = GlossaryStore.terms_in(terms, chunk[0].source)
+            if len(cited) < len(terms):
+                try:
+                    return review_once(chunk_base, chunk, glossary=cited)
+                except ReviewContextOverflow as retry_overflow:
+                    overflow = retry_overflow
+            buffer_event(
+                "review_chunk_skipped",
+                start_index=chunk_base,
+                count=1,
+                segment=chunk[0].index,
+                reason="context_length",
+                trigger=overflow.trigger,
+            )
+            if debug is not None and chapter_index is not None:
+                # Cache the skip so resume does not resend a request known not to fit.
+                debug.mark_chunk_done(
+                    chunk_key(chunk_base, 1),
+                    {
+                        "issues": [],
+                        "initial_issues": [],
+                        "dismissed": [],
+                        "fallback_reason": "",
+                        "skipped": {
+                            "round": review_round,
+                            "chapter": chapter_index,
+                            "segment": chunk[0].index,
+                            "reason": "context_length",
+                        },
+                    },
+                )
+            return []
 
         def review_one(job: tuple[int, list]) -> list[dict]:
             """Review one initial contiguous block with local recovery as needed."""

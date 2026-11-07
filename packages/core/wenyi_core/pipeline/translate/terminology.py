@@ -14,6 +14,7 @@ from typing import Any
 from ...agents.glossary_extractor import GlossaryExtractor, TranslatedSegmentEvidence
 from ...agents.terminology import (
     TerminologyAgent,
+    TerminologyContextOverflow,
     TerminologyKnowledgeError,
     TerminologyReferenceError,
 )
@@ -24,7 +25,7 @@ from ...glossary.evidence_models import (
     KnowledgeResult,
     SourcePassage,
 )
-from ...glossary.store import TYPE_PERSON, GlossaryTerm, source_matches_text
+from ...glossary.store import TYPE_PERSON, GlossaryStore, GlossaryTerm, source_matches_text
 from ...i18n.policy.models import content_hash
 from ...models.document import Chapter, Segment
 from ...storage.protocol import Storage
@@ -163,9 +164,46 @@ class TerminologyService:
             if self.checkpoint_usage is not None:
                 self.checkpoint_usage()
 
-    def _discover(self, passages: list[SourcePassage]) -> DiscoveryResult:
-        existing = self.store.all_terms()
+    def _discover(
+        self, passages: list[SourcePassage], existing: list[GlossaryTerm] | None = None
+    ) -> DiscoveryResult:
+        """Discover terms, shrinking requests that exceed the model context.
 
+        Oversized requests first keep only the existing entries the passages cite, then
+        halve the passages; a single passage that still cannot fit discovers nothing.
+        """
+        full = self.store.all_terms() if existing is None else existing
+        try:
+            return self._discover_once(passages, full)
+        except TerminologyContextOverflow as overflow:
+            cited = GlossaryStore.terms_in(full, "\n".join(p.source for p in passages))
+            step = "glossary" if len(cited) < len(full) else "split"
+            if step == "split" and len(passages) == 1:
+                step = "skip"
+            self.store.log_event(
+                "terminology_request_trimmed",
+                operation="terminology.discover",
+                passage_count=len(passages),
+                step=step,
+                reason="context_length",
+                trigger=overflow.trigger,
+            )
+            if step == "glossary":
+                return self._discover(passages, cited)
+            if step == "skip":
+                return DiscoveryResult()
+            half = len(passages) // 2
+            left = self._discover(passages[:half], full)
+            right = self._discover(passages[half:], full)
+            seen = {term.source for term in left.terms}
+            return DiscoveryResult(
+                terms=left.terms + [term for term in right.terms if term.source not in seen],
+                rejections=left.rejections + right.rejections,
+            )
+
+    def _discover_once(
+        self, passages: list[SourcePassage], existing: list[GlossaryTerm]
+    ) -> DiscoveryResult:
         def invoke() -> dict[str, Any]:
             result = self.agent.discover(passages, existing)
             return {
@@ -188,6 +226,23 @@ class TerminologyService:
         )
 
     def _knowledge(self, term: GlossaryTerm) -> tuple[KnowledgeResult, dict[str, list[int]]] | None:
+        """Collect evidence; a request that cannot fit the context leaves the term unresolved."""
+        try:
+            return self._knowledge_once(term)
+        except TerminologyContextOverflow as overflow:
+            self.store.log_event(
+                "terminology_request_trimmed",
+                operation=f"terminology.{overflow.task}",
+                source=term.source,
+                step="skip",
+                reason="context_length",
+                trigger=overflow.trigger,
+            )
+            return None
+
+    def _knowledge_once(
+        self, term: GlossaryTerm
+    ) -> tuple[KnowledgeResult, dict[str, list[int]]] | None:
         groups = self.index.evidence_groups(term, self.store.all_terms())
         if not groups:
             return None

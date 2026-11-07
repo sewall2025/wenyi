@@ -239,7 +239,7 @@ def _build_epub_from_chapters(
                 if href:
                     images_by_position.setdefault(position, []).append(href)
 
-        paragraphs = _merged_paragraphs(ch)
+        paragraphs = _merged_paragraphs(ch, bilingual=bilingual)
         for position, (kind, target, source, level) in enumerate(paragraphs):
             body_parts.extend(
                 f'<div class="fb2-image"><img src="{escape(href, quote=True)}" alt=""/></div>'

@@ -29,13 +29,38 @@ def test_translate_chapter_enqueues_only_requested_chapter(monkeypatch):
     assert result["kind"] == "chapter_translation"
 
 
-@pytest.mark.parametrize("entries,code", [([], 404), ([{"index": 0, "status": "done"}], 409)])
+@pytest.mark.parametrize(
+    "entries,code",
+    [
+        ([], 404),
+        ([{"index": 0, "status": "done"}], 409),
+        ([{"index": 0, "status": "done", "word_count": 3, "target_word_count": 3}], 409),
+    ],
+)
 def test_translate_chapter_rejects_missing_or_completed_chapter(monkeypatch, entries, code):
     monkeypatch.setattr(chapters, "require_project", lambda pid: {"id": pid, "fmt": "text"})
     monkeypatch.setattr(current_context().repository, "chapter_summaries", lambda pid: entries)
     with pytest.raises(HTTPException) as error:
         asyncio.run(chapters.translate_chapter("project-1", 0))
     assert error.value.status_code == code
+
+
+def test_translate_chapter_retries_finished_chapter_with_refused_segments(monkeypatch):
+    monkeypatch.setattr(chapters, "require_project", lambda pid: {"id": pid, "fmt": "text"})
+    monkeypatch.setattr(
+        current_context().repository,
+        "chapter_summaries",
+        lambda pid: [{"index": 0, "status": "done", "word_count": 3, "target_word_count": 2}],
+    )
+    enqueued = []
+
+    async def start(pid, kind, *, params):
+        enqueued.append((pid, kind, params))
+        return {"job_id": "chapter-job", "project_id": pid, "kind": kind}
+
+    monkeypatch.setattr(chapters, "start_job", start)
+    asyncio.run(chapters.translate_chapter("project-1", 0))
+    assert enqueued == [("project-1", "chapter_translation", {"chapter_index": 0})]
 
 
 def test_translate_chapter_propagates_queue_failure(monkeypatch):

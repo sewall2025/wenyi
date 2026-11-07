@@ -179,7 +179,7 @@ def test_translation_truncation_uses_alignment_retry_and_paragraph_fallback(trun
     successes = (
         [_response('{"translations":["First.","Second."]}')]
         if truncated_attempts == 1
-        else [_response('{"translations":["First."]}'), _response('{"translations":["Second."]}')]
+        else [_response("First."), _response("Second.")]
     )
     stub = _ClientStub([_truncated_response() for _ in range(truncated_attempts)] + successes)
     client.adapter("default")._client = stub

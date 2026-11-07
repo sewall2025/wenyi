@@ -159,7 +159,9 @@ def _render_epub_resources(
         for href, (segments, template, _fresh_meta) in prepared.items():
             template_soup = BeautifulSoup(template, "html.parser")
             occupied_ids, tn_id_index = _index_soup_ids(template_soup)
-            by_anchor, src_by_anchor, kind_by_anchor, _stored_meta = _segment_render_maps(segments)
+            by_anchor, src_by_anchor, kind_by_anchor, _stored_meta = _segment_render_maps(
+                segments, bilingual=True
+            )
             source_ids = _build_source_anchor_ids(
                 by_anchor,
                 src_by_anchor,

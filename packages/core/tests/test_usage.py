@@ -109,12 +109,14 @@ class _MeteredFakeClient(FakeClient):
         operation: str,
         json_mode: bool = False,
         max_tokens: int | None = None,
+        json_schema=None,
     ) -> str:
         result = super().complete(
             messages,
             operation=operation,
             json_mode=json_mode,
             max_tokens=max_tokens,
+            json_schema=json_schema,
         )
         self.usage.record(
             self.routes[operation].tier or "direct",

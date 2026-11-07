@@ -6,6 +6,7 @@ import pytest
 from wenyi_core.agents.terminology import TerminologyAgent
 from wenyi_core.config import Config
 from wenyi_core.glossary.evidence_models import DiscoveryResult, SourcePassage
+from wenyi_core.llm.providers.fake import FakeClient as HandlerClient
 from wenyi_core.models.glossary import GlossaryTerm
 from wenyi_core.pipeline.orchestrator import Orchestrator
 from wenyi_core.pipeline.translate.terminology import TerminologyService
@@ -234,3 +235,51 @@ def test_orchestrator_rejected_proposal_never_reaches_enrichment_or_formal_gloss
         require_value(store.load_usage())["totals"]["calls"]
         == client.usage_summary()["totals"]["calls"]
     )
+
+
+def _overflow_error(operation):
+    from wenyi_core.llm.retrying import ContextLengthExceeded
+
+    return ContextLengthExceeded(provider="fake", operation=operation, status_code=400, window=None)
+
+
+def test_oversized_discovery_trims_glossary_then_halves_then_skips(tmp_path):
+    store, chapters = book_store(tmp_path)
+    store.upsert_term(GlossaryTerm("Zed", "泽德"))
+    store.upsert_term(GlossaryTerm("Beth", "贝丝"))
+    payloads = []
+
+    def handler(messages, tier, json_mode):
+        payload = json.loads(messages[-1]["content"].split("\n", 1)[-1].strip() or "{}")
+        payloads.append(payload)
+        if "Zed" in json.dumps(payload) or len(payload["passages"]) > 1:
+            raise _overflow_error("terminology.discover")
+        if "Carl" in json.dumps(payload["passages"]):
+            raise _overflow_error("terminology.discover")
+        return json.dumps({"terms": [candidate("Beth")]})
+
+    client = HandlerClient(handler=handler)
+    agent = TerminologyAgent(client, Config(source_lang="en", target_lang="zh"))
+    service = TerminologyService(store, agent, chapters)
+    result = service._discover(service.index.for_segments(1, chapters[1].segments))
+    assert [term.source for term in result.terms] == ["Beth"]
+    steps = [e["step"] for e in store.list_events(event_type="terminology_request_trimmed")]
+    # Drop the uncited existing entry, halve, then the Carl passage still overflows alone.
+    assert steps == ["glossary", "split", "skip"]
+    assert [len(p["existing"]) for p in payloads] == [2, 1, 1, 1]
+
+
+def test_oversized_evidence_request_leaves_person_unresolved(tmp_path):
+    store, chapters = book_store(tmp_path)
+
+    def handler(messages, tier, json_mode):
+        raise _overflow_error("terminology.evidence")
+
+    client = HandlerClient(handler=handler)
+    agent = TerminologyAgent(client, Config(source_lang="en", target_lang="zh"))
+    service = TerminologyService(store, agent, chapters)
+    outcome = service.admit(GlossaryTerm("Alice", "爱丽丝", type="person"), 0)
+    assert outcome == "unresolved"
+    assert store.all_terms() == []
+    events = store.list_events(event_type="terminology_request_trimmed")
+    assert [(e["operation"], e["step"]) for e in events] == [("terminology.evidence", "skip")]

@@ -10,6 +10,7 @@ from wenyi_core.agents.translator import Translator
 from wenyi_core.config import Config
 from wenyi_core.i18n.prompts import template
 from wenyi_core.llm.providers.fake import FakeClient
+from wenyi_core.llm.retrying import ProviderRequestError
 
 
 def _count_segments(user_content: str) -> int:
@@ -18,6 +19,8 @@ def _count_segments(user_content: str) -> int:
 
 def _annotation_payload(user_content: str):
     marker = "[Paragraph-specific annotation references] (JSON; only for paragraphs in applies_to, not text to translate)\n"
+    if marker not in user_content:
+        marker = "[Annotation references] (JSON; reference only, not text to translate)\n"
     payload = user_content.split(marker, 1)[1].split("\n\n[Recent translations]", 1)[0]
     return json.loads(payload)
 
@@ -75,42 +78,38 @@ class TestTranslatorAlignment(unittest.TestCase):
         self.assertEqual(result, ["-", "42", "……", "(100%)"])
         self.assertEqual(client.calls, [])
 
-    def test_fallback_error_reports_original_segment_index_after_filtering(self):
-        client = FakeClient(
-            handler=lambda messages, tier, json_mode: json.dumps({"translations": []})
-        )
-        translator = Translator(client, self._config())
-
-        with self.assertRaisesRegex(Exception, "failed at paragraph 1"):
-            translator.translate_batch(["-", "本文", "42"])
-
-    def test_fallback_to_per_segment_on_mismatch(self):
-        # Return one fewer paragraph for batches but valid single results to trigger individual fallback.
+    def test_refused_paragraph_keeps_original_index_after_filtering(self):
         def handler(messages, tier, json_mode):
+            return json.dumps({"translations": []}) if json_mode else "  "
+
+        translator = Translator(FakeClient(handler=handler), self._config())
+
+        self.assertEqual(translator.translate_batch(["-", "本文", "42"]), ["-", None, "42"])
+        self.assertEqual(list(translator.last_refused), [1])
+        self.assertEqual(translator.last_refused[1].reason, "empty_reply")
+
+    def test_fallback_to_plain_text_paragraphs_on_mismatch(self):
+        def handler(messages, tier, json_mode):
+            if not json_mode:
+                return "单段"
             n = _count_segments(messages[-1]["content"])
-            trans = [f"译{i}" for i in range(n)]
-            if n > 1:
-                trans = trans[:-1]  # Deliberately return a paragraph-count mismatch.
-            return json.dumps({"translations": trans}, ensure_ascii=False)
+            return json.dumps({"translations": [f"译{i}" for i in range(n - 1)]})
 
         client = FakeClient(handler=handler)
-        t = Translator(client, self._config())
-        out = t.translate_batch(["あ", "い", "う"])
-        self.assertEqual(len(out), 3)  # Fallback must still guarantee one-to-one alignment.
-        # Verify fallback made at least one single-paragraph call.
-        single_calls = [
-            c for c in client.calls if _count_segments(c["messages"][-1]["content"]) == 1
-        ]
-        self.assertGreaterEqual(len(single_calls), 3)
+        out = Translator(client, self._config()).translate_batch(["あ", "い", "う"])
 
-    def test_empty_per_segment_fallback_is_rejected(self):
-        client = FakeClient(
-            handler=lambda messages, tier, json_mode: json.dumps({"translations": [""]})
-        )
-        translator = Translator(client, self._config())
+        self.assertEqual(out, ["单段", "单段", "单段"])
+        plain = [call for call in client.calls if not call["json_mode"]]
+        self.assertEqual(len(plain), 3)
+        self.assertNotIn("JSON", plain[0]["messages"][0]["content"].split("\n", 1)[0])
 
-        with self.assertRaisesRegex(Exception, "failed at paragraph 0"):
-            translator.translate_batch(["あ", "い"])
+    def test_empty_plain_text_reply_is_refused(self):
+        def handler(messages, tier, json_mode):
+            return json.dumps({"translations": [""]}) if json_mode else ""
+
+        translator = Translator(FakeClient(handler=handler), self._config())
+
+        self.assertEqual(translator.translate_batch(["あ", "い"]), [None, None])
 
     def test_mineru_allows_empty_string_translations(self):
         """MinerU may persist blank targets when the model returns empty OCR-junk refusals."""
@@ -126,23 +125,13 @@ class TestTranslatorAlignment(unittest.TestCase):
         )
         self.assertEqual(out, ["", ""])
 
-    def test_mineru_empty_allowance_still_rejects_non_string(self):
-        client = FakeClient(
-            handler=lambda messages, tier, json_mode: json.dumps({"translations": [None]})
-        )
-        translator = Translator(client, self._config())
+    def test_non_string_json_translation_falls_back_to_plain_text(self):
+        def handler(messages, tier, json_mode):
+            return json.dumps({"translations": [None]}) if json_mode else "「译」"
 
-        with self.assertRaisesRegex(Exception, "failed at paragraph 0"):
-            translator.translate_batch(["あ"], allow_empty_translations=True)
+        translator = Translator(FakeClient(handler=handler), self._config())
 
-    def test_non_string_translation_is_rejected(self):
-        client = FakeClient(
-            handler=lambda messages, tier, json_mode: json.dumps({"translations": [None]})
-        )
-        translator = Translator(client, self._config())
-
-        with self.assertRaisesRegex(Exception, "failed at paragraph 0"):
-            translator.translate_batch(["あ"])
+        self.assertEqual(translator.translate_batch(["あ"]), ["译"])
 
     def test_provider_failure_is_not_retried_by_alignment_layer(self):
         """Provider transport retries must not be multiplied by translation alignment recovery."""
@@ -158,6 +147,45 @@ class TestTranslatorAlignment(unittest.TestCase):
             translator.translate_batch(["あ", "い"])
 
         self.assertEqual(len(client.calls), 1)
+
+    def test_provider_error_refuses_only_that_paragraph(self):
+        def handler(messages, tier, json_mode):
+            if json_mode or "あ" in messages[-1]["content"].rsplit("[Following", 1)[0]:
+                raise ProviderRequestError(
+                    provider="fake",
+                    operation="translation.body",
+                    error_type="http_error",
+                    status_code=400,
+                    reason=None,
+                    resumable=False,
+                )
+            return "好"
+
+        translator = Translator(FakeClient(handler=handler), self._config())
+
+        self.assertEqual(translator.translate_batch(["あ", "い"]), [None, "好"])
+        self.assertEqual(translator.last_refused[0].reason, "invalid_request")
+
+    def test_authentication_failure_stops_the_batch(self):
+        calls = 0
+
+        def handler(messages, tier, json_mode):
+            nonlocal calls
+            calls += 1
+            raise ProviderRequestError(
+                provider="fake",
+                operation="translation.body",
+                error_type="http_error",
+                status_code=401,
+                reason=None,
+                resumable=False,
+            )
+
+        translator = Translator(FakeClient(handler=handler), self._config())
+
+        with self.assertRaises(ProviderRequestError):
+            translator.translate_batch(["あ", "い"])
+        self.assertEqual(calls, 1)
 
 
 class TestMinerUEmptyTargetResume(unittest.TestCase):
@@ -291,13 +319,12 @@ class TestTranslatorAnnotationContexts(unittest.TestCase):
         singleton_payloads = []
 
         def handler(messages, tier, json_mode):
-            n = _count_segments(messages[-1]["content"])
             payload = _annotation_payload(messages[-1]["content"])
-            if n > 1:
+            if json_mode:
                 batch_payloads.append(payload)
                 return json.dumps({"translations": []})
             singleton_payloads.append(payload)
-            return json.dumps({"translations": ["译"]}, ensure_ascii=False)
+            return "译"
 
         translator = Translator(FakeClient(handler=handler), self._config())
         result = translator.translate_batch(

@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from abc import abstractmethod
+from collections.abc import Callable
+from contextlib import nullcontext
 from types import SimpleNamespace
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel
 
-from ..retrying import EmptyResponseError, IncompleteStreamError, TruncatedResponseError
+from ..limits import interrupt_stream
+from ..retrying import (
+    EmptyResponseError,
+    IncompleteStreamError,
+    StreamErrorEvent,
+    StreamTimeoutError,
+    TruncatedResponseError,
+)
 from ..transport import (
     ConnectionOptions,
     Messages,
@@ -124,34 +135,141 @@ def normalize_openai_usage(usage: Any, *, separate_cache_writes: bool = True) ->
     )
 
 
-def _read_stream(stream: Any) -> tuple[Any, Any, Any]:
-    """Join one complete streamed completion into ``(message, finish_reason, usage)``.
+_STREAM_TAIL_CHARS = 80
+_STREAM_ERROR_FIELD_CHARS = 40
+# Error events that asking again with the same request cannot fix.
+_PERMANENT_STREAM_ERRORS = frozenset({"context_length_exceeded", "invalid_request_error"})
 
-    A stream that ends without a finish reason was cut off; its partial text and usage are
-    discarded so the shared retry policy can request a complete answer.
+
+def _stream_error_event(error: Any, *, provider: str, operation: str) -> StreamErrorEvent:
+    """Classify an SDK ``data: {"error": ...}`` event by its code and type, never its message."""
+    body = error.body if isinstance(error.body, dict) else {}
+    fields = {key: str(body.get(key) or "")[:_STREAM_ERROR_FIELD_CHARS] for key in ("code", "type")}
+    message = body.get("message")
+    diagnostic = (
+        f"code={fields['code']!r} type={fields['type']!r} "
+        f"message_chars={len(message) if isinstance(message, str) else 0}"
+    )
+    return StreamErrorEvent(
+        provider=provider,
+        operation=operation,
+        retryable=not _PERMANENT_STREAM_ERRORS.intersection(fields.values()),
+        diagnostic=diagnostic,
+    )
+
+
+# ponytail: SSE keep-alives reset httpx's read timeout, so a watchdog thread closes the stream
+# when no useful chunk arrived for this long (capped by the connection timeout). Hidden-reasoning
+# models that think silently longer than this are cut off; raise the cap if one needs it.
+_STREAM_IDLE_SECONDS = 300.0
+_STREAM_WATCHDOG_POLL_SECONDS = 1.0
+_STREAM_PROGRESS_SECONDS = 30.0
+
+
+class _StreamWatchdog:
+    """Close ``stream`` once the attempt outlives ``total`` or goes ``idle`` seconds quiet."""
+
+    def __init__(self, stream: Any, *, total: float, idle: float):
+        self.stream = stream
+        self.total = total
+        self.idle = idle
+        self.started = self.last_useful = time.monotonic()
+        self.expired: str | None = None
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._watch, name="wenyi-stream-watchdog")
+        self._thread.daemon = True
+
+    def __enter__(self) -> _StreamWatchdog:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self._done.set()
+        self._thread.join()
+
+    def _watch(self) -> None:
+        while not self._done.wait(_STREAM_WATCHDOG_POLL_SECONDS):
+            now = time.monotonic()
+            if now - self.started >= self.total:
+                self.expired = f"stream exceeded the {self.total:g}s total request limit"
+            elif now - self.last_useful >= self.idle:
+                self.expired = f"stream sent no content for {self.idle:g}s"
+            else:
+                continue
+            interrupt_stream(self.stream)
+            return
+
+
+def _read_stream(
+    stream: Any,
+    *,
+    timeout: float | None = None,
+    emit: Callable[..., None] | None = None,
+) -> tuple[Any, Any, Any, int]:
+    """Join one streamed completion into ``(message, finish_reason, usage, chunks)``.
+
+    ``finish_reason`` stays None when the stream ended without one; the caller decides whether
+    the joined text is still a complete answer. With ``timeout``, the attempt is closed after
+    that many seconds in total, or after an idle stretch without content, finish or usage
+    chunks, and raises a retryable :class:`StreamTimeoutError`.
     """
     content: list[str] = []
     reasoning: list[str] = []
     finish_reason = None
     usage = None
-    with stream:
-        for chunk in stream:
-            usage = getattr(chunk, "usage", None) or usage
-            for choice in getattr(chunk, "choices", None) or []:
-                finish_reason = getattr(choice, "finish_reason", None) or finish_reason
-                delta = getattr(choice, "delta", None)
-                text = getattr(delta, "content", None)
-                if isinstance(text, str):
-                    content.append(text)
-                text = getattr(delta, "reasoning_content", None)
-                if isinstance(text, str):
-                    reasoning.append(text)
-    if finish_reason is None:
-        raise IncompleteStreamError("OpenAI-compatible stream ended without a finish reason")
+    chunks = 0
+    chars = 0
+    watchdog = (
+        _StreamWatchdog(stream, total=timeout, idle=min(timeout, _STREAM_IDLE_SECONDS))
+        if timeout
+        else None
+    )
+    reported = time.monotonic()
+    try:
+        with watchdog or nullcontext(), stream:
+            for chunk in stream:
+                chunks += 1
+                useful = False
+                if getattr(chunk, "usage", None):
+                    usage = chunk.usage
+                    useful = True
+                for choice in getattr(chunk, "choices", None) or []:
+                    if getattr(choice, "finish_reason", None):
+                        finish_reason = choice.finish_reason
+                        useful = True
+                    delta = getattr(choice, "delta", None)
+                    for parts, field in ((content, "content"), (reasoning, "reasoning_content")):
+                        text = getattr(delta, field, None)
+                        if isinstance(text, str) and text:
+                            parts.append(text)
+                            chars += len(text)
+                            useful = True
+                now = time.monotonic()
+                if useful and watchdog is not None:
+                    watchdog.last_useful = now
+                if emit is not None and now - reported >= _STREAM_PROGRESS_SECONDS:
+                    emit("llm_stream_progress", chunks=chunks, chars=chars)
+                    reported = now
+    except Exception as error:
+        if watchdog is not None and watchdog.expired:
+            raise StreamTimeoutError(watchdog.expired) from error
+        raise
+    if watchdog is not None and watchdog.expired:
+        raise StreamTimeoutError(watchdog.expired)
     message = SimpleNamespace(
         content="".join(content), reasoning_content="".join(reasoning) if reasoning else None
     )
-    return message, finish_reason, usage
+    return message, finish_reason, usage, chunks
+
+
+def _is_complete_json(text: str | None) -> bool:
+    """Strictly parse a whole JSON object or array; a cut-off document never parses."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        return isinstance(json.loads(text.strip()), (dict, list))
+    except json.JSONDecodeError:
+        return False
 
 
 class OpenAIConnectionOptions(ConnectionOptions):
@@ -159,6 +277,8 @@ class OpenAIConnectionOptions(ConnectionOptions):
 
     # Streaming keeps gateways from closing long idle requests; it never changes model output.
     stream: bool = True
+    # Strict schemas constrain reply shape where the gateway supports them; callers still validate.
+    structured_output: Literal["none", "json_schema"] = "none"
 
 
 class OpenAICompatibleBaseClient(ProviderAdapter, Generic[OptionsT]):
@@ -169,6 +289,11 @@ class OpenAICompatibleBaseClient(ProviderAdapter, Generic[OptionsT]):
     @property
     def stream(self) -> bool:
         return self.connection_options.model_validate(self.cfg.model_extra or {}).stream
+
+    @property
+    def structured_output(self) -> str:
+        options = self.connection_options.model_validate(self.cfg.model_extra or {})
+        return options.structured_output
 
     def _ensure_client(self) -> Any:
         with self._client_lock:
@@ -208,6 +333,53 @@ class OpenAICompatibleBaseClient(ProviderAdapter, Generic[OptionsT]):
     ) -> str | None:
         return None
 
+    def _unterminated_stream(
+        self,
+        model_config: ResolvedModel[OptionsT],
+        message: Any,
+        usage: Any,
+        chunks: int,
+        *,
+        json_mode: bool,
+        context: RequestContext,
+    ) -> str:
+        """Accept a JSON reply whose stream only lost its final stop chunk; reject the rest.
+
+        Some gateways end the stream cleanly without sending ``finish_reason``. A strictly
+        complete JSON document cannot be a mid-reply cut, so it is treated as ``stop``.
+        """
+        content = message.content
+        reasoning = message.reasoning_content or ""
+        stats = {
+            "chunks": chunks,
+            "content_chars": len(content),
+            "reasoning_chars": len(reasoning),
+            "usage_received": usage is not None,
+        }
+        candidate = (
+            content
+            if content.strip()
+            else self._json_response_fallback(model_config, message)
+            if json_mode
+            else None
+        )
+        if json_mode and _is_complete_json(candidate):
+            context.emit("stream_missing_finish_reason", **stats)
+            return "stop"
+        # Each attempt is billed by the provider, so record it like a length-stopped attempt.
+        context.record_usage(self._normalize_usage(usage))
+        tail = (content or reasoning)[-_STREAM_TAIL_CHARS:]
+        if context.redact_diagnostic is not None:
+            tail = context.redact_diagnostic(tail)
+        diagnostic = (
+            f"chunks={chunks} content_chars={len(content)} reasoning_chars={len(reasoning)} "
+            f"usage={'yes' if usage is not None else 'no'} tail={tail!r}"
+        )
+        raise IncompleteStreamError(
+            f"OpenAI-compatible stream ended without a finish reason ({diagnostic})",
+            diagnostic=diagnostic,
+        )
+
     @abstractmethod
     def _build_request_kwargs(
         self,
@@ -231,11 +403,40 @@ class OpenAICompatibleBaseClient(ProviderAdapter, Generic[OptionsT]):
         kwargs = self._build_request_kwargs(
             model, messages, json_mode=json_mode, max_tokens=context.max_tokens
         )
+        if json_mode and context.json_schema and self.structured_output == "json_schema":
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "wenyi_output",
+                    "strict": True,
+                    "schema": context.json_schema,
+                },
+            }
         completions = self._ensure_client().chat.completions
         if self.stream:
             kwargs["stream"] = True
             kwargs["stream_options"] = {"include_usage": True}
-            message, finish_reason, usage = _read_stream(completions.create(**kwargs))
+            stream = completions.create(**kwargs)
+            track = context.track_stream or nullcontext
+            try:
+                with track(stream):
+                    message, finish_reason, usage, chunks = _read_stream(
+                        stream, timeout=self.cfg.timeout, emit=context.emit
+                    )
+            except Exception as error:
+                from openai import APIError
+
+                # HTTP and connection failures use APIError subclasses; the SDK raises the
+                # base class only for an error event inside an already started stream.
+                if type(error) is not APIError:
+                    raise
+                raise _stream_error_event(
+                    error, provider=self.cfg.kind, operation=context.operation
+                ) from error
+            if finish_reason is None:
+                finish_reason = self._unterminated_stream(
+                    model_config, message, usage, chunks, json_mode=json_mode, context=context
+                )
         else:
             response = completions.create(**kwargs)
             usage = getattr(response, "usage", None)

@@ -37,6 +37,9 @@ def routing_handler(messages, tier, json_mode):
         n = _count_numbered(user)
         return json.dumps({"titles": [f"标题{i}" for i in range(n)]}, ensure_ascii=False)
 
+    if "translating one" in system:
+        return "译文"
+
     if "literary translator" in system:
         # Polish may append a user turn to the same translation conversation.
         if "Polish the translations from your previous JSON response" in user:
@@ -98,6 +101,7 @@ class MeteredFakeClient(FakeClient):
         operation,
         json_mode=False,
         max_tokens=None,
+        json_schema=None,
     ):
         self.usage.record(
             self.routes[operation].tier or "direct",
@@ -114,4 +118,5 @@ class MeteredFakeClient(FakeClient):
             operation=operation,
             json_mode=json_mode,
             max_tokens=max_tokens,
+            json_schema=json_schema,
         )

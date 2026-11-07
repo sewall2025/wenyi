@@ -22,6 +22,7 @@ from ..glossary.store import (
 from ..i18n.policy.models import content_hash
 from ..llm.base import LLMClient
 from ..llm.json_parser import JsonParseError, parse_json_result
+from ..llm.retrying import ContextLengthExceeded
 from ..storage.protocol import Storage
 from . import prompts
 from .base import Agent
@@ -199,11 +200,35 @@ class GlossaryExtractor(Agent):
                 ):
                     raise ValueError("Invalid glossary history alignment cache")
                 return dict(cached_mappings)
-        text = self.client.complete(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            operation="glossary.align_history",
-            json_mode=True,
-        )
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        trigger = None
+        if not self.client.fits_context_window("glossary.align_history", messages, source_tokens=0):
+            trigger = "context_window"
+        else:
+            try:
+                text = self.client.complete(
+                    messages, operation="glossary.align_history", json_mode=True
+                )
+            except ContextLengthExceeded:
+                trigger = "context_length"
+        if trigger is not None:
+            # Oversized requests are halved; a single candidate that still cannot fit stays
+            # deferred like an unresolved mapping and is retried by a later chapter.
+            if store is not None:
+                store.log_event(
+                    "glossary_history_alignment_trimmed",
+                    candidate_count=len(candidates),
+                    step="split" if len(candidates) > 1 else "defer",
+                    reason="context_length",
+                    trigger=trigger,
+                )
+            if len(candidates) == 1:
+                return {}
+            half = len(candidates) // 2
+            return {
+                **self._history_mappings(candidates[:half], store=store),
+                **self._history_mappings(candidates[half:], store=store),
+            }
         try:
             parsed = parse_json_result(text)
         except JsonParseError:

@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 from ...agents.glossary_extractor import TranslatedSegmentEvidence
+from ...agents.single_segment import ServiceHealth
 from ...config import PipelineConfig
 from ...events import ProgressFn
 from ...glossary.store import GlossaryStore
@@ -29,6 +30,9 @@ from .precision import PrecisionBatchExecutor, PrecisionError
 from .terminology import TerminologyService
 from .title_translation import TitleTranslationService
 from .translation_batch import BatchPlan, BatchResult, TranslationBatchExecutor, resume_batches
+
+# Book-level refusal markers: segments every model refused, retried by the next run.
+REFUSED_SEGMENTS_KEY = "translation/refused.json"
 
 if TYPE_CHECKING:
     from ..annotate.annotations import AnnotationService
@@ -54,6 +58,10 @@ class TranslationService:
         self._titles = TitleTranslationService(runtime.title_translator)
         self._batches = TranslationBatchExecutor(runtime.translator, runtime.polisher)
         self._precision = PrecisionBatchExecutor(runtime.client, runtime.config)
+        self._degraded_segments = 0
+        self._health = ServiceHealth()
+        # Refusal markers produced by the current run, keyed by (chapter, segment).
+        self._refusals: dict[tuple[int, int], dict[str, Any]] = {}
 
     def run(
         self,
@@ -78,7 +86,7 @@ class TranslationService:
             targets = [only_chapter]
             progress_chapters = targets
         else:
-            targets = store.pending_chapters()
+            targets = self.chapters_to_translate(store)
             progress_chapters = [chapter["index"] for chapter in manifest.get("chapters", [])]
 
         total, done = self.progress_counts(store, progress_chapters)
@@ -94,6 +102,9 @@ class TranslationService:
             if policy.enabled("terminology.context")
             else None
         )
+        self._degraded_segments = 0
+        self._health = ServiceHealth()
+        self._refusals = {}
         store.log_event(
             "translate_run_started",
             only_chapter=only_chapter,
@@ -126,8 +137,59 @@ class TranslationService:
             self._runtime.usage.flush(store, scope="translate")
         if progress and total:
             progress(total, total, "Translation complete")
-        store.log_event("translate_run_finished", total_segments=total)
+        refused = self.refused_segments(store)
+        store.log_event(
+            "translate_run_finished",
+            total_segments=total,
+            precision_degraded_segments=self._degraded_segments,
+            refused_segments=len(refused),
+            refused=[{"chapter": item["chapter"], "segment": item["segment"]} for item in refused],
+        )
         return store
+
+    @staticmethod
+    def chapters_to_translate(store: Storage) -> list[int]:
+        """Pending chapters plus finished chapters that still hold refused (``None``) segments."""
+        pending = set(store.pending_chapters())
+        indices = [
+            chapter["index"]
+            for chapter in store.load_manifest().get("chapters", [])
+            if isinstance(chapter.get("index"), int)
+        ]
+        return [
+            index
+            for index in indices
+            if index in pending
+            or any(segment.target is None for segment in store.load_chapter(index).text_segments)
+        ]
+
+    @staticmethod
+    def refused_segments(store: Storage) -> list[dict[str, Any]]:
+        """Return the persisted refusal markers in book order."""
+        record = store.read_artifact(REFUSED_SEGMENTS_KEY)
+        items = record.get("segments", []) if isinstance(record, dict) else []
+        return [item for item in items if isinstance(item, dict)]
+
+    def record_refusals(self, store: Storage, chapter: int, refused: list[int]) -> None:
+        """Replace one chapter's refusal markers and log segments a retry has now translated."""
+        previous = self.refused_segments(store)
+        kept = [item for item in previous if item.get("chapter") != chapter]
+        before = {item.get("segment"): item for item in previous if item.get("chapter") == chapter}
+        for segment in sorted(set(before) - set(refused), key=str):
+            store.log_event("segment_translation_recovered", chapter=chapter, segment=segment)
+        current = [
+            self._refusals.get((chapter, segment))
+            or before.get(segment)
+            or {"chapter": chapter, "segment": segment, "tried": [], "routes": [], "reason": ""}
+            for segment in refused
+        ]
+        if not current and not before:
+            return
+        items = sorted(
+            [*kept, *current], key=lambda item: (item.get("chapter", 0), item.get("segment", 0))
+        )
+        with store.state_lock():
+            store.write_artifact(REFUSED_SEGMENTS_KEY, {"segments": items})
 
     @staticmethod
     def load_translation_inputs(
@@ -238,6 +300,8 @@ class TranslationService:
         with store.state_lock():
             chapter = store.load_chapter(ci)
             self._precision.recover_publications(store, chapter)
+        # A finished chapter re-entered only to retry refused segments keeps its extraction.
+        already_done = ci not in store.pending_chapters()
         analysis = store.load_analysis()
         text_segs = chapter.text_segments
         if not text_segs:
@@ -375,6 +439,7 @@ class TranslationService:
                     plan,
                     store,
                     checkpoint=checkpoint_precision_usage,
+                    health=self._health,
                     progress=(
                         (lambda phase: progress(done, total, f"{label} · {phase}"))
                         if progress
@@ -385,14 +450,29 @@ class TranslationService:
                 text_segs = chapter.text_segments
                 b = text_segs[batch_start : batch_start + len(b)]
                 self._precision.mark_published(store, result)
+                self._degraded_segments += len(result.degraded)
             else:
-                result = self._batches.execute(plan, polish=self._runtime.config.pipeline.polish)
+                result = self._batches.execute(
+                    plan, polish=self._runtime.config.pipeline.polish, health=self._health
+                )
                 for segment, target, before_polish in zip(b, result.targets, result.before_polish):
                     segment.target = target
                     segment.target_before_polish = before_polish
                 # Persist translations incrementally so interruption resumes after this batch.
                 store.save_chapter(chapter)
             self._align_batch_context(store, chapter, batch_start, len(b))
+            for entry in result.degraded:
+                if entry.get("fallback") != "refused":
+                    continue
+                marker = {
+                    "chapter": ci,
+                    "segment": entry["segment"],
+                    "tried": entry.get("tried", []),
+                    "routes": entry.get("routes", []),
+                    "reason": entry.get("reason", ""),
+                }
+                self._refusals[(ci, entry["segment"])] = marker
+                store.log_event("segment_translation_refused", **marker)
             store.log_event(
                 "batch_translated",
                 chapter=ci,
@@ -409,7 +489,7 @@ class TranslationService:
                     for i, s in enumerate(b)
                 ],
             )
-            done += len(b)
+            done += sum(s.target is not None for s in b)
             seg_base += len(b)
             if progress:
                 progress(done, total, label)
@@ -429,25 +509,33 @@ class TranslationService:
             # The glossary may have changed; refresh before the next real translation, not after the final batch.
             term_snapshot_stale = True
 
-        # Keep chapter-wide extraction as a fallback for address, speech and fixed expressions needing context.
-        # Final review reads the stable glossary after the entire book finishes translating.
-        src_text = "\n".join(s.source for s in text_segs)
-        tgt_text = "\n".join(s.target or "" for s in text_segs)
-        chapter_glossary_summary = self._runtime.extractor.extract_and_store(
-            glossary,
-            src_text,
-            tgt_text,
-            ci,
-            history=translation_history.values(),
-            before=(ci, len(text_segs)),
-            source_corpus=source_corpus,
-            **({"admit": terminology.admit} if terminology is not None else {}),
-        )
-        store.log_event(
-            "chapter_glossary_extracted",
-            chapter=ci,
-            summary=chapter_glossary_summary,
-        )
+        # Every batch went through the whole fallback chain, so a remaining ``None`` is a
+        # segment all models refused. The chapter still completes; the next run retries it.
+        refused = [s.index for s in text_segs if s.target is None]
+        self.record_refusals(store, ci, refused)
+        if refused:
+            store.log_event("chapter_translated_with_gaps", chapter=ci, refused_segments=refused)
+        if not already_done:
+            # Keep chapter-wide extraction as a fallback for address, speech and fixed expressions
+            # needing context. Final review reads the stable glossary after the whole book.
+            translated = [s for s in text_segs if s.target is not None]
+            src_text = "\n".join(s.source for s in translated)
+            tgt_text = "\n".join(s.target or "" for s in translated)
+            chapter_glossary_summary = self._runtime.extractor.extract_and_store(
+                glossary,
+                src_text,
+                tgt_text,
+                ci,
+                history=translation_history.values(),
+                before=(ci, len(text_segs)),
+                source_corpus=source_corpus,
+                **({"admit": terminology.admit} if terminology is not None else {}),
+            )
+            store.log_event(
+                "chapter_glossary_extracted",
+                chapter=ci,
+                summary=chapter_glossary_summary,
+            )
 
         store.save_chapter_with_status(chapter, STATUS_DONE)
         store.log_event(

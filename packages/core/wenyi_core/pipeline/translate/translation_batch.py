@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from typing import Any
 
 from ...agents.polisher import Polisher
+from ...agents.single_segment import ServiceHealth
 from ...agents.translator import Translator
+from ...glossary.store import GlossaryStore
 from ...ingest.segmenter import batch_segments
 from ...markup.ruby import strip_ruby_markers
 from ...models.document import Segment
@@ -46,13 +49,22 @@ class BatchPlan:
         *,
         allow_empty_translations: bool = False,
     ) -> BatchPlan:
-        """Detach mutable term and annotation metadata from subsequent chapter updates."""
+        """Detach mutable term and annotation metadata from subsequent chapter updates.
+
+        Only glossary entries cited by this batch's source text (or its annotation
+        sources) are kept, in the snapshot's stable insertion order, so prompt size
+        tracks the batch instead of the whole book and fingerprints stay reproducible.
+        """
+        cited = "\n".join(
+            [s.source for s in segments]
+            + [item.get("source", "") for contexts in annotation_contexts for item in contexts]
+        )
         return cls(
             chapter,
             start_index,
             tuple(s.index for s in segments),
             tuple(s.source for s in segments),
-            tuple(deepcopy(terms)),
+            tuple(deepcopy(GlossaryStore.terms_in(terms, cited))),
             context,
             style,
             book_synopsis,
@@ -65,9 +77,12 @@ class BatchPlan:
 
 @dataclass(frozen=True)
 class BatchResult:
-    targets: tuple[str, ...]
+    # ``None`` marks a segment every fallback refused; the next run retries it.
+    targets: tuple[str | None, ...]
     before_polish: tuple[str | None, ...]
     precision_key: str | None = None
+    # One marker per segment that fell back to a draft or standard mode, or was refused.
+    degraded: tuple[dict[str, Any], ...] = ()
 
 
 class TranslationBatchExecutor:
@@ -75,7 +90,9 @@ class TranslationBatchExecutor:
         self._translator = translator
         self._polisher = polisher
 
-    def execute(self, plan: BatchPlan, *, polish: bool) -> BatchResult:
+    def execute(
+        self, plan: BatchPlan, *, polish: bool, health: ServiceHealth | None = None
+    ) -> BatchResult:
         """Translate and optionally polish; the chapter service alone applies the result."""
         terms = list(plan.terms)
         targets = self._translator.translate_batch(
@@ -88,9 +105,28 @@ class TranslationBatchExecutor:
             annotation_contexts=plan.annotation_contexts,
             next_source=plan.next_source,
             allow_empty_translations=plan.allow_empty_translations,
+            health=health,
         )
-        targets = [strip_ruby_markers(target) for target in targets]
+        refused = [
+            {
+                "segment": plan.segment_indices[index],
+                "position": plan.start_index + index,
+                "stage": "batch",
+                "fallback": "refused",
+                "reason": outcome.reason,
+                "tried": ["batch", *outcome.tried],
+                "routes": outcome.routes,
+            }
+            for index, outcome in sorted(self._translator.last_refused.items())
+        ]
+        targets = [None if target is None else strip_ruby_markers(target) for target in targets]
         before_polish: tuple[str | None, ...] = (None,) * len(targets)
+        if polish and not self._translator.client.batch_output("polish.body"):
+            # Standard polish needs aligned JSON lists; keep the translation and say why.
+            self._translator.client.emit_event(
+                "polish_skipped", operation="polish.body", reason="batch_output_disabled"
+            )
+            polish = False
         if polish:
             before_polish = tuple(targets)
             turn = self._translator.last_batch_turn
@@ -107,17 +143,23 @@ class TranslationBatchExecutor:
                     polished = list(targets)
                     for index, text in zip(indices, continued):
                         polished[index] = strip_ruby_markers(text)
-            if polished is None:
-                polished = self._polisher.polish(
-                    targets,
+            if polished is None and any(target is not None for target in targets):
+                # Refused segments stay ``None``; polish only the translated ones.
+                kept = [index for index, target in enumerate(targets) if target is not None]
+                subset = self._polisher.polish(
+                    [targets[index] for index in kept],
                     glossary_terms=terms,
                     style=plan.style,
                     next_source=plan.next_source,
-                    sources=list(plan.sources),
+                    sources=[plan.sources[index] for index in kept],
                 )
-            if len(polished) == len(targets):
+                if len(subset) == len(kept):
+                    polished = list(targets)
+                    for index, text in zip(kept, subset):
+                        polished[index] = text
+            if polished is not None and len(polished) == len(targets):
                 targets = polished
-        return BatchResult(tuple(targets), before_polish)
+        return BatchResult(tuple(targets), before_polish, degraded=tuple(refused))
 
 
 def resume_batches(segments: list[Segment], max_tokens: int) -> list[list[Segment]]:

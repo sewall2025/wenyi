@@ -44,7 +44,7 @@ segment:
 pipeline:
   # Body translation and Reviewer requests always use the full glossary.
   review: true # Run final review after whole-book translation; disable with --no-review
-  # Additional structural retries for standard translation and each precision stage; 0 disables retries.
+  # Additional structural retries for standard translation and precision single-paragraph repair; 0 disables retries.
   align_retry_limit: 2
   polish: true # Polish the full translation with the strong tier; enabled by default and adds substantial cost
   translation_mode: standard # standard | best_of_three; best_of_three requires polish
@@ -122,7 +122,7 @@ class PipelineConfig(BaseModel):
         return self
 
     review: bool = True
-    # Additional structural retries for standard translation and precision generation/synthesis.
+    # Additional structural retries for standard translation and precision single-paragraph repair.
     align_retry_limit: int = 2
     polish: bool = (
         True  # Polish the full translation with the strong tier by default; disable to save cost
@@ -254,12 +254,20 @@ class Config(BaseModel):
             if self.pipeline.translation_mode == "best_of_three":
                 return (
                     "precision",
+                    "segment_translator",
+                    "segment_synthesizer",
                     "title_translator",
                     "glossary_extractor",
                     "glossary_history",
                 ) + terminology
             return (
-                ("translator", "title_translator", "glossary_extractor", "glossary_history")
+                (
+                    "translator",
+                    "segment_translator",
+                    "title_translator",
+                    "glossary_extractor",
+                    "glossary_history",
+                )
                 + (("polisher",) if self.pipeline.polish else ())
                 + terminology
             )

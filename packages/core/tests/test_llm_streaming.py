@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from types import SimpleNamespace
 
 import httpx
 import pytest
+from wenyi_core.llm.limits import RequestCancelled
+from wenyi_core.llm.providers import _openai_compatible
 from wenyi_core.llm.retrying import (
+    ContextLengthExceeded,
     EmptyResponseError,
     IncompleteStreamError,
+    StreamErrorEvent,
+    StreamTimeoutError,
     TruncatedResponseError,
     retry_reason,
 )
@@ -106,14 +113,16 @@ def test_stream_ignores_empty_choices_and_missing_delta(monkeypatch):
 def test_stream_length_stop_is_truncated_after_recording_usage(monkeypatch):
     stream = _complete_stream("Part", finish_reason="length")
     client, completions = _client(monkeypatch, [stream])
-    with pytest.raises(TruncatedResponseError):
+    with pytest.raises(TruncatedResponseError) as caught:
         client.complete(MESSAGES, operation="translation.body")
     assert len(completions.calls) == 1
     assert stream.closed
     assert _totals(client)["total_tokens"] == 10
+    # The reported prompt plus completion total lets callers learn the context window.
+    assert caught.value.usage_total == 10
 
 
-def test_stream_without_finish_reason_is_retried_and_discarded(monkeypatch):
+def test_stream_without_finish_reason_is_retried_and_its_usage_recorded(monkeypatch):
     events: list[dict] = []
     incomplete = FakeStream([stream_chunk(content="Part"), stream_chunk(usage=USAGE)])
     client, completions = _client(
@@ -125,7 +134,89 @@ def test_stream_without_finish_reason_is_retried_and_discarded(monkeypatch):
     assert [event["reason"] for event in events if event["event"] == "llm_retry_wait"] == [
         "incomplete_stream"
     ]
-    assert (_totals(client)["calls"], _totals(client)["total_tokens"]) == (1, 10)
+    # Each attempt is billed by the provider, so the cut-off attempt is recorded once too.
+    assert (_totals(client)["calls"], _totals(client)["total_tokens"]) == (2, 20)
+
+
+def test_json_stream_without_finish_reason_accepts_complete_json(monkeypatch):
+    events: list[dict] = []
+    stream = FakeStream(
+        [
+            stream_chunk(content='{"translations":'),
+            stream_chunk(content=' ["ok"]}\n'),
+            stream_chunk(usage=USAGE),
+        ]
+    )
+    client, completions = _client(monkeypatch, [stream], events=events, max_retries=0)
+    result = client.complete(MESSAGES, json_mode=True, operation="translation.body")
+    assert result == '{"translations": ["ok"]}\n'
+    assert len(completions.calls) == 1
+    missing = [event for event in events if event["event"] == "stream_missing_finish_reason"]
+    assert len(missing) == 1
+    assert (missing[0]["chunks"], missing[0]["content_chars"]) == (3, 25)
+    assert not any(event["event"] == "llm_retry_wait" for event in events)
+    assert _totals(client)["total_tokens"] == 10
+
+
+def test_json_stream_without_finish_reason_rejects_truncated_json(monkeypatch):
+    events: list[dict] = []
+    stream = FakeStream(
+        [
+            stream_chunk(content='{"translations": ["first", "sec'),
+            stream_chunk(usage=USAGE),
+        ]
+    )
+    client, _ = _client(monkeypatch, [stream], events=events, max_retries=0)
+    with pytest.raises(IncompleteStreamError) as raised:
+        client.complete(MESSAGES, json_mode=True, operation="translation.body")
+    message = str(raised.value)
+    for field in ("chunks=2", "content_chars=31", "reasoning_chars=0", "usage=yes"):
+        assert field in message
+    assert 'tail=\'{"translations": ["first", "sec\'' in message
+    exhausted = [event for event in events if event["event"] == "llm_retry_exhausted"]
+    assert exhausted[0]["reason"] == "incomplete_stream"
+    assert exhausted[0]["diagnostic"] == raised.value.diagnostic
+    assert _totals(client)["total_tokens"] == 10
+
+
+def test_stream_diagnostic_tail_is_short_and_redacted(monkeypatch):
+    text = "x" * 200 + "sk-test-secret"
+    events: list[dict] = []
+    client, _ = _client(
+        monkeypatch, [FakeStream([stream_chunk(content=text)])], events=events, max_retries=0
+    )
+    client._redact = lambda value: value.replace("sk-test-secret", "[redacted]")
+    with pytest.raises(IncompleteStreamError) as raised:
+        client.complete(MESSAGES, operation="translation.body")
+    assert "usage=no" in str(raised.value)
+    assert len(raised.value.diagnostic) < 200
+    exhausted = next(event for event in events if event["event"] == "llm_retry_exhausted")
+    assert "sk-test-secret" not in exhausted["diagnostic"]
+    assert _totals(client)["calls"] == 0
+
+
+def test_plain_stream_without_finish_reason_fails_even_when_text_is_json(monkeypatch):
+    client, _ = _client(monkeypatch, [FakeStream([stream_chunk(content="{}")])], max_retries=0)
+    with pytest.raises(IncompleteStreamError):
+        client.complete(MESSAGES, operation="translation.body")
+
+
+def test_json_stream_without_finish_reason_uses_reasoning_fallback(monkeypatch):
+    stream = FakeStream([stream_chunk(reasoning_content='{"translations":["ok"]}')])
+    config = model_config(
+        kind="openai-compatible",
+        base_url="https://example.invalid/v1",
+        max_retries=0,
+        profiles={
+            "strong": {"model": "m", "options": {"json_response_fallback": "reasoning_content"}}
+        },
+    )
+    client = RoutedLLMClient(config)
+    client.adapter("default")._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=_Completions([stream]))
+    )
+    result = client.complete(MESSAGES, json_mode=True, operation="translation.body")
+    assert result == '{"translations":["ok"]}'
 
 
 def test_interrupted_stream_is_retried_and_usage_counted_once(monkeypatch):
@@ -141,6 +232,77 @@ def test_interrupted_stream_is_retried_and_usage_counted_once(monkeypatch):
         "connection"
     ]
     assert (_totals(client)["calls"], _totals(client)["total_tokens"]) == (1, 10)
+
+
+def _stream_error(code, error_type="server_error", message="secret prompt text sk-test"):
+    from openai import APIError
+
+    body = {"code": code, "type": error_type, "message": message}
+    request = httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+    return FakeStream([stream_chunk(content="Part"), APIError(body["message"], request, body=body)])
+
+
+def test_stream_error_event_is_retried_with_a_message_free_diagnostic(monkeypatch):
+    events: list[dict] = []
+    broken = _stream_error("overloaded")
+    client, completions = _client(monkeypatch, [broken, _complete_stream("Done")], events=events)
+    assert client.complete(MESSAGES, operation="translation.body") == "Done"
+    assert len(completions.calls) == 2
+    assert broken.closed
+    waits = [event for event in events if event["event"] == "llm_retry_wait"]
+    assert [event["reason"] for event in waits] == ["stream_error"]
+    assert waits[0]["diagnostic"] == "code='overloaded' type='server_error' message_chars=26"
+    assert "secret" not in repr(events)
+
+
+@pytest.mark.parametrize(("code", "error_type"), [("bad", "invalid_request_error")])
+def test_permanent_stream_error_event_is_not_retried(monkeypatch, code, error_type):
+    from openai import APIError
+
+    events: list[dict] = []
+    client, completions = _client(monkeypatch, [_stream_error(code, error_type)], events=events)
+    with pytest.raises(StreamErrorEvent) as raised:
+        client.complete(MESSAGES, operation="translation.body")
+    assert len(completions.calls) == 1
+    assert retry_reason(raised.value) is None
+    assert isinstance(raised.value.__cause__, APIError)
+    assert "secret" not in str(raised.value)
+    failed = [event for event in events if event["event"] == "llm_request_failed"]
+    assert failed[0]["error_category"] == "stream_error"
+    assert failed[0]["error_message"] == "The provider reported an error during streaming."
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "window"),
+    [
+        ("context_length_exceeded", "secret prompt text sk-test", None),
+        # Magpie forwards only the upstream text, cut off after the parameter hint.
+        (
+            "",
+            '上游 400: {"error":{"message":"This model\'s maximum context length is 24576 '
+            "tokens. However, you requested 0 output tokens and your prompt contains at least "
+            "24577 input tokens. Please reduce the length of the input prompt. (paramet",
+            24576,
+        ),
+    ],
+)
+def test_context_overflow_stream_event_is_classified_and_teaches_the_window(
+    monkeypatch, code, message, window
+):
+    events: list[dict] = []
+    client, completions = _client(
+        monkeypatch, [_stream_error(code, "", message)], events=events, max_retries=3
+    )
+    with pytest.raises(ContextLengthExceeded) as raised:
+        client.complete(MESSAGES, operation="translation.body")
+    assert len(completions.calls) == 1  # Resending the same prompt cannot fit it.
+    assert raised.value.window == window
+    assert retry_reason(raised.value) is None
+    assert client.context_window("translation.body") == window
+    failed = [event for event in events if event["event"] == "llm_request_failed"]
+    assert failed[0]["error_category"] == "context_length"
+    assert "secret" not in repr(events)
+    assert not [event for event in events if event["event"] == "llm_retry_wait"]
 
 
 def test_streamed_reasoning_content_feeds_json_fallback(monkeypatch):
@@ -213,3 +375,141 @@ def test_identity_matches_values_before_stream_option():
 def test_gemini_rejects_stream_connection_option():
     with pytest.raises(ValueError):
         model_config(kind="gemini", stream=False)
+
+
+SCHEMA = {
+    "type": "object",
+    "properties": {"translations": {"type": "object"}},
+    "required": ["translations"],
+    "additionalProperties": False,
+}
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_structured_output_sends_strict_schema_on_both_paths(monkeypatch, stream):
+    outcome = (
+        _complete_stream("{}")
+        if stream
+        else SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="{}"), finish_reason="stop")],
+            usage=USAGE,
+        )
+    )
+    client, completions = _client(
+        monkeypatch, [outcome], stream=stream, structured_output="json_schema"
+    )
+    client.complete(MESSAGES, operation="translation.body", json_mode=True, json_schema=SCHEMA)
+    assert completions.calls[0]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "wenyi_output", "strict": True, "schema": SCHEMA},
+    }
+
+
+@pytest.mark.parametrize(
+    ("connection", "json_mode", "schema", "expected"),
+    [
+        ({}, True, SCHEMA, {"type": "json_object"}),
+        ({"structured_output": "none"}, True, SCHEMA, {"type": "json_object"}),
+        ({"structured_output": "json_schema"}, True, None, {"type": "json_object"}),
+        ({"structured_output": "json_schema"}, False, SCHEMA, None),
+    ],
+)
+def test_structured_output_falls_back_to_json_mode(
+    monkeypatch, connection, json_mode, schema, expected
+):
+    client, completions = _client(monkeypatch, [_complete_stream("{}")], **connection)
+    client.complete(MESSAGES, operation="translation.body", json_mode=json_mode, json_schema=schema)
+    assert completions.calls[0].get("response_format") == expected
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["deepseek", "openai", "openrouter", "opencode-go", "openai-compatible", "orcarouter"],
+)
+def test_structured_output_is_excluded_from_identity(kind):
+    base_url = {"openai-compatible": {"base_url": "https://example.invalid/v1"}}.get(kind, {})
+    routes = [
+        resolve_routes(model_config(kind=kind, **base_url, **extra))["translation.body"]
+        for extra in ({}, {"structured_output": "none"}, {"structured_output": "json_schema"})
+    ]
+    assert len({route.model_identity for route in routes}) == 1
+    assert len({route.fingerprint for route in routes}) == 1
+
+
+@pytest.mark.parametrize("kind", ["gemini", "fake"])
+def test_non_openai_connections_reject_structured_output(kind):
+    with pytest.raises(ValueError):
+        model_config(kind=kind, structured_output="json_schema")
+
+
+def test_structured_output_rejects_unknown_mode():
+    with pytest.raises(ValueError):
+        model_config(structured_output="json_object")
+
+
+class _SlowStream(FakeStream):
+    """Yield ``chunk`` every ``delay`` seconds until closed, like a never-ending SSE stream."""
+
+    def __init__(self, chunk, delay=0.01):
+        super().__init__([])
+        self.chunk, self.delay = chunk, delay
+
+    def close(self):
+        self.closed = True
+
+    def __iter__(self):
+        while not self.closed:
+            time.sleep(self.delay)
+            yield self.chunk
+
+
+@pytest.fixture
+def fast_watchdog(monkeypatch):
+    monkeypatch.setattr(_openai_compatible, "_STREAM_WATCHDOG_POLL_SECONDS", 0.01)
+
+
+def test_stream_total_timeout_closes_attempt_and_retries(monkeypatch, fast_watchdog):
+    endless = _SlowStream(stream_chunk(content="x"))
+    events: list[dict] = []
+    client, completions = _client(
+        monkeypatch, [endless, _complete_stream("ok")], events=events, timeout=0.2
+    )
+    assert client.complete(MESSAGES, operation="translation.body") == "ok"
+    assert endless.closed and len(completions.calls) == 2
+    retry = [event for event in events if event["event"] == "llm_retry_wait"]
+    assert retry and retry[0]["reason"] == "timeout"
+
+
+def test_stream_heartbeats_without_content_trigger_idle_timeout(monkeypatch, fast_watchdog):
+    monkeypatch.setattr(_openai_compatible, "_STREAM_IDLE_SECONDS", 0.1)
+    heartbeat = _SlowStream(SimpleNamespace(choices=[], usage=None))
+    client, completions = _client(monkeypatch, [heartbeat], max_retries=0, timeout=30)
+    started = time.monotonic()
+    with pytest.raises(StreamTimeoutError, match="no content"):
+        client.complete(MESSAGES, operation="translation.body")
+    assert time.monotonic() - started < 5 and heartbeat.closed
+    assert retry_reason(StreamTimeoutError("idle")) == "timeout"
+
+
+def test_cancel_closes_open_stream_and_is_not_retried(monkeypatch):
+    endless = _SlowStream(stream_chunk(content="x"))
+    client, completions = _client(monkeypatch, [endless, _complete_stream("never")], timeout=30)
+    timer = threading.Timer(0.1, client.cancel)
+    timer.start()
+    started = time.monotonic()
+    with pytest.raises(RequestCancelled):
+        client.complete(MESSAGES, operation="translation.body")
+    timer.join()
+    assert time.monotonic() - started < 5
+    assert endless.closed and len(completions.calls) == 1
+    assert not client.limits._streams
+
+
+def test_stream_progress_events_report_chunks_and_characters(monkeypatch):
+    monkeypatch.setattr(_openai_compatible, "_STREAM_PROGRESS_SECONDS", 0)
+    events: list[dict] = []
+    client, _ = _client(monkeypatch, [_complete_stream("ab", "cde")], events=events)
+    assert client.complete(MESSAGES, operation="translation.body") == "abcde"
+    progress = [event for event in events if event["event"] == "llm_stream_progress"]
+    assert progress[-1]["chunks"] == 4 and progress[-1]["chars"] == 5
+    assert progress[0]["operation"] == "translation.body"

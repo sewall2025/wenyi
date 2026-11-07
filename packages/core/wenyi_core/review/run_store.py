@@ -240,6 +240,7 @@ class ReviewRunStore:
         error: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Persist the final unified result and return an in-memory copy."""
+        skipped = self.skipped_segments()
         result: dict[str, Any] = {
             "review_id": self.review_id,
             "status": status,
@@ -250,7 +251,9 @@ class ReviewRunStore:
             "summary": dict(summary),
             "issues": list(issues),
             "changes": list(changes),
+            "skipped_segments": skipped,
         }
+        result["summary"]["skipped_segment_count"] = len(skipped)
         if error is not None:
             result["error"] = dict(error)
         self._atomic_json(os.path.join(self.run_dir, "result.json"), result)
@@ -322,6 +325,17 @@ class ReviewRunStore:
 
     def load_chunk_result(self, chunk_id: str) -> dict[str, Any] | None:
         return self._read(os.path.join(self.run_dir, "chunks", f"{chunk_id}.json"))
+
+    def skipped_segments(self) -> list[dict[str, Any]]:
+        """Return paragraphs whose Review was skipped, from resume-safe chunk caches."""
+        found = []
+        for name in self._names("chunks"):
+            if not name.endswith(".json"):
+                continue
+            skipped = (self.load_chunk_result(name[:-5]) or {}).get("skipped")
+            if isinstance(skipped, dict):
+                found.append(skipped)
+        return sorted(found, key=lambda s: (s.get("round") or 0, s["chapter"], s["segment"]))
 
     def rebuild_snapshots_from_chunks(self, review_round: int) -> None:
         """Rebuild initial/dismissed snapshots from persisted chunk caches.

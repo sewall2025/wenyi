@@ -1,6 +1,7 @@
 """Desktop catalog uses isolated temporary workspaces and no external services."""
 
 import inspect
+import json
 import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -933,3 +934,48 @@ def test_verbatim_workspace_reopens_existing_catalog(tmp_path):
             storage.close()
     finally:
         reopened.close()
+
+
+def test_settings_save_model_limits_batch_output_and_route_fallbacks(backend):
+    from wenyi_desktop.main import create_app
+
+    client = TestClient(create_app(context=current_context()))
+    settings = client.get("/settings").json()
+    document = settings["effective"]
+    llm = document["llm"]
+    primary = llm["tiers"]["strong"]
+    provider = llm["models"][primary]["provider"]
+    llm["models"]["plain"] = {
+        "provider": provider,
+        "model": "plain-mt",
+        "context_window": 24576,
+        "max_output_tokens": 4096,
+        "batch_output": False,
+    }
+    llm["routes"] = {
+        "translation.body": {"model": "plain"},
+        "translation.title": {"model": primary, "fallbacks": ["plain"]},
+    }
+    body = {
+        "yaml": json.dumps(document),
+        "revision": settings["revision"],
+        "default_template": settings["default_template"],
+    }
+    # A batch-only operation cannot fall back to a model that refuses JSON batches.
+    rejected = client.put("/settings", json=body)
+    assert rejected.status_code == 422, rejected.text
+    assert "batch_output" in rejected.text
+    llm["models"]["plain"]["batch_output"] = True
+    llm["routes"]["translation.title"]["fallbacks"] = ["plain"]
+    body["yaml"] = json.dumps(document)
+    saved = client.put("/settings", json=body)
+    assert saved.status_code == 200, saved.text
+    effective = client.get("/settings").json()["effective"]["llm"]
+    assert effective["models"]["plain"]["context_window"] == 24576
+    assert effective["models"]["plain"]["max_output_tokens"] == 4096
+    assert effective["routes"]["translation.title"]["fallbacks"] == ["plain"]
+    llm["routes"] = {"review.verify": {"model": primary, "fallbacks": ["plain"]}}
+    body = {**body, "yaml": json.dumps(document), "revision": settings["revision"] + 1}
+    evidence = client.put("/settings", json=body)
+    assert evidence.status_code == 422
+    assert "failover is not allowed" in evidence.text

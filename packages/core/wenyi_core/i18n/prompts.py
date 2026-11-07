@@ -34,6 +34,7 @@ def render(
         "translator_system",
         "review_fixer_system",
         "precision_generation_system",
+        "segment_translator_system",
     }:
         values["lang_guidance"] = values.pop("configured_lang_guidance")
     for key, value in values.items():

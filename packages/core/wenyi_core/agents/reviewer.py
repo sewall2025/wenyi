@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..errors import WenyiError
+from ..ingest.tokens import count_tokens
 from ..llm.json_parser import parse_json_result
+from ..llm.retrying import ContextLengthExceeded
 from . import prompts
 from .base import Agent
 
@@ -21,6 +23,18 @@ class ReviewOutputError(WenyiError, ValueError):
     def __init__(self, reason: str):
         super().__init__(f"Review output protocol error: {reason}")
         self.reason = reason
+
+
+class ReviewContextOverflow(WenyiError):
+    """The review request does not fit the model context; only a smaller input helps.
+
+    ``trigger`` is ``context_window`` for the local preflight estimate and
+    ``context_length`` when the provider rejected the request.
+    """
+
+    def __init__(self, trigger: str):
+        super().__init__(f"Review request exceeds the model context ({trigger})")
+        self.trigger = trigger
 
 
 @dataclass(frozen=True)
@@ -70,6 +84,10 @@ class Reviewer(Agent):
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
+        if not self.client.fits_context_window(
+            "review.scan", messages, source_tokens=sum(count_tokens(s) for s in sources)
+        ):
+            raise ReviewContextOverflow("context_window")
         if trace:
             trace("request", {"messages": [dict(message) for message in messages]})
         try:
@@ -78,6 +96,10 @@ class Reviewer(Agent):
                 operation="review.scan",
                 json_mode=True,
             )
+        except ContextLengthExceeded as error:
+            if trace:
+                trace("error", {"error_type": type(error).__name__, "error": str(error)})
+            raise ReviewContextOverflow("context_length") from error
         except Exception as error:
             if trace:
                 trace(

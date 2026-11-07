@@ -81,7 +81,6 @@ def test_batch_passes_mineru_blank_allowance_to_translator():
 def test_chapter_service_limits_blank_allowance_and_resumes_without_retranslation(
     tmp_path, backend
 ):
-    from wenyi_core.agents.translator import AlignmentError
     from wenyi_core.pipeline.orchestrator import Orchestrator
     from wenyi_core.storage.run_store import STATUS_PENDING
 
@@ -104,6 +103,8 @@ def test_chapter_service_limits_blank_allowance_and_resumes_without_retranslatio
     config.pipeline.align_retry_limit = 0
 
     def handler(messages, tier, json_mode):
+        if "translating one" in messages[0]["content"]:
+            return "  "
         if "literary translator" in messages[0]["content"]:
             return '{"translations": [""]}'
         return routing_handler(messages, tier, json_mode)
@@ -111,9 +112,13 @@ def test_chapter_service_limits_blank_allowance_and_resumes_without_retranslatio
     client = FakeClient(handler=handler)
     service = Orchestrator(config, client)._translation
     if backend != "mineru":
-        with pytest.raises(AlignmentError):
-            service.run(store, book_synopsis="")
+        # A blank reply is never a translation: the segment is refused, the chapter finishes.
+        service.run(store, book_synopsis="")
         assert store.load_chapter(0).text_segments[0].target is None
+        assert store.pending_chapters() == []
+        assert [item["segment"] for item in service.refused_segments(store)] == [
+            store.load_chapter(0).text_segments[0].index
+        ]
         return
 
     service.run(store, book_synopsis="")
