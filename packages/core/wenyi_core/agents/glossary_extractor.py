@@ -12,11 +12,13 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from ..config import Config
+from ..glossary.admission import active_terms, admission_status, admit_candidate
 from ..glossary.store import (
     TYPE_TERM,
     GlossaryOccurrenceMatcher,
     GlossaryStore,
     GlossaryTerm,
+    normalize_aliases,
     source_matches_text,
 )
 from ..i18n.policy.models import content_hash
@@ -57,6 +59,14 @@ class GlossaryExtractor(Agent):
         self._recurrence_matcher: GlossaryOccurrenceMatcher | None = None
         self._recurrence_cache: dict[tuple[str, str, tuple[str, ...]], bool] = {}
 
+    def _corpus_matcher(self, source_corpus: str) -> GlossaryOccurrenceMatcher:
+        """Normalize the book source once per run and reuse it for every frequency check."""
+        if source_corpus is not self._recurrence_corpus or self._recurrence_matcher is None:
+            self._recurrence_corpus = source_corpus
+            self._recurrence_matcher = GlossaryOccurrenceMatcher(source_corpus)
+            self._recurrence_cache.clear()
+        return self._recurrence_matcher
+
     def _recurring_existing_terms(
         self,
         terms: list[GlossaryTerm],
@@ -65,11 +75,7 @@ class GlossaryExtractor(Agent):
         """Return existing terms occurring at least twice in the book and cache per-term
         matches.
         """
-        if source_corpus is not self._recurrence_corpus:
-            self._recurrence_corpus = source_corpus
-            self._recurrence_matcher = GlossaryOccurrenceMatcher(source_corpus)
-            self._recurrence_cache.clear()
-
+        self._corpus_matcher(source_corpus)
         assert self._recurrence_matcher is not None
         missing: list[GlossaryTerm] = []
         for term in terms:
@@ -122,7 +128,9 @@ class GlossaryExtractor(Agent):
                     reading=_text(d.get("reading")) if self.src == "ja" else "",
                     type=_text(d.get("type"), TYPE_TERM),
                     gender=gender,
-                    aliases=[alias for a in aliases if (alias := _text(a))],
+                    aliases=normalize_aliases(
+                        source, [alias for a in aliases if (alias := _text(a))]
+                    ),
                     note=_text(d.get("note")),
                 )
             )
@@ -353,14 +361,27 @@ class GlossaryExtractor(Agent):
         With source_corpus, inject only existing terms occurring at least twice in the
         source. Low-frequency terms remain stored but do not repeatedly consume extraction
         context.
+        Candidates failing glossary.admission are dropped and counted as ``rejected`` plus
+        ``rejected_<reason>``. With source_corpus, non-entity entries found fewer than twice
+        in the book are stored with status ``candidate`` (counted as ``candidates``) and
+        stay out of translation prompts.
         """
-        all_existing = store.all_terms()
+        all_existing = active_terms(store.all_terms())
         existing = (
             self._recurring_existing_terms(all_existing, source_corpus)
             if source_corpus is not None
             else all_existing
         )
-        terms = self.extract(source_text, target_text, existing)
+        batch_sources = source_text.splitlines()
+        rejected: dict[str, int] = {}
+        admitted: list[GlossaryTerm] = []
+        for term in self.extract(source_text, target_text, existing):
+            reason = admit_candidate(term, batch_sources)
+            if reason is None:
+                admitted.append(term)
+            else:
+                rejected[reason] = rejected.get(reason, 0) + 1
+        terms = admitted
         occurrences = (
             self._first_occurrences(terms, store, history, before) if before is not None else {}
         )
@@ -374,10 +395,17 @@ class GlossaryExtractor(Agent):
             "history_matched": len(occurrences),
             "history_aligned": aligned,
             "history_unresolved": unresolved,
+            "rejected": sum(rejected.values()),
+            **{f"rejected_{reason}": count for reason, count in sorted(rejected.items())},
+            "candidates": 0,
         }
+        matcher = self._corpus_matcher(source_corpus) if source_corpus is not None else None
         for t in terms:
             evidence = occurrences.get(t.source)
             t.first_chapter = evidence.chapter if evidence is not None else chapter
+            if matcher is not None:
+                t.status = admission_status(t, matcher)
+                summary["candidates"] += t.status != "ok"
             result = admit(t, chapter) if admit else store.upsert_term(t, chapter=chapter)
             summary[result] = summary.get(result, 0) + 1
         return summary

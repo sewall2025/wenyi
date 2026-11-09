@@ -15,12 +15,14 @@ llm:
 segment:
   # Target batch size in tokens (tiktoken cl100k_base).
   max_tokens_per_batch: 1800
+  # Maximum segments per batch; a batch closes at whichever limit is reached first.
+  max_segments_per_batch: 6
   # Split longer paragraphs at sentence boundaries by the same token budget; merge on export.
   max_tokens_per_segment: 1200
 
 # ── Pipeline options (quality and cost)───────────────────────────────────────────
 pipeline:
-  # Body translation and Reviewer requests always use the full glossary.
+  # Body translation and Reviewer requests receive only the glossary entries their source cites.
   review: true # Run final review after whole-book translation; disable with --no-review
   # Additional structural retries for standard translation and precision single-paragraph repair; 0 disables retries.
   align_retry_limit: 2

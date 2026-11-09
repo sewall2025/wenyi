@@ -78,8 +78,10 @@ class TestConfigFileCreation(unittest.TestCase):
             self.assertTrue(cfg.pipeline.review_autofix)
             self.assertEqual(cfg.pipeline.pdf_backend, "mineru")
             self.assertEqual(cfg.segment.max_tokens_per_batch, 1800)
+            self.assertEqual(cfg.segment.max_segments_per_batch, 6)
             self.assertEqual(cfg.segment.max_tokens_per_segment, 1200)
             self.assertIn("max_tokens_per_batch: 1800", generated)
+            self.assertIn("max_segments_per_batch: 6", generated)
             self.assertIn("max_tokens_per_segment: 1200", generated)
             self.assertNotIn("max_chars_per_batch", generated)
             self.assertEqual(cfg.pipeline.rolling_context_tokens, 512)
@@ -109,6 +111,8 @@ class TestConfigFileCreation(unittest.TestCase):
         # (audit Y-3); max_tokens_per_segment=0 legitimately disables splitting.
         with self.assertRaisesRegex(ValidationError, "max_tokens_per_batch"):
             Config.from_dict({"segment": {"max_tokens_per_batch": 0}})
+        with self.assertRaisesRegex(ValidationError, "max_segments_per_batch"):
+            Config.from_dict({"segment": {"max_segments_per_batch": 0}})
         cfg = Config.from_dict({"segment": {"max_tokens_per_segment": 0}})
         self.assertEqual(cfg.segment.max_tokens_per_segment, 0)
 

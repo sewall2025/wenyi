@@ -363,12 +363,12 @@ The command-line flags `--polish`, `--no-polish`, `--review`, and `--no-review`
 override the corresponding configuration values for a `translate` run.
 
 Body translation receives only the glossary entries cited by each batch, and fresh
-Reviewer requests receive the full glossary; there is no scope selector. Remove `pipeline.glossary_scope` from existing YAML or project
+Reviewer requests receive only the entries cited by each chunk; there is no scope selector. Remove `pipeline.glossary_scope` from existing YAML or project
 configuration: the retired key is rejected, including `full`. See [glossary policy](pipeline.md#glossary)
 for snapshot refresh, resume behavior, and the prompt-size tradeoff.
 
 Run final review independently with `wenyi review INPUT`. Matching content,
-configuration, full-glossary policy, and glossary fingerprints reuse completed results
+configuration, cited-glossary policy, and glossary fingerprints reuse completed results
 or resume unfinished work. Otherwise, Review starts a new run. By default, Review
 publishes folded changes after the shadow loop. Use `--no-autofix` to keep that
 invocation read-only, or `--autofix` to force publishing when the config is off.
@@ -406,6 +406,7 @@ Only the monolingual edition is enabled by default. `--bilingual` enables both e
 ```yaml
 segment:
   max_tokens_per_batch: 1800
+  max_segments_per_batch: 6
   max_tokens_per_segment: 1200
 
 honorific:
@@ -416,6 +417,7 @@ paths:
 ```
 
 - `max_tokens_per_batch`: source-token budget for one model translation request, counted with tiktoken `cl100k_base` (a universal estimator, not the live provider tokenizer). Must be at least 1.
+- `max_segments_per_batch`: maximum number of segments in one translation batch (standard and precision). A batch closes at whichever of this cap or `max_tokens_per_batch` is reached first; smaller batches keep models from miscounting segment ids. Default 6, must be at least 1. Changing either limit re-cuts pending batches: saved targets are kept and skipped, while precision checkpoints and candidates of the old cut are not reused for the new batches.
 - `max_tokens_per_segment`: token threshold for splitting an exceptionally long source paragraph at sentence boundaries. `0` disables splitting.
 - `honorific.strategy`: Japanese-source honorific policy: `keep_style`, `normalize`, or `drop`.
 - `state_dir`: location of book checkpoints, chapter files, the glossary database, usage data, and reports.

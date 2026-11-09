@@ -14,6 +14,7 @@ from wenyi_core.storage.precision_archive import PrecisionArchive
 from tests.fake_llm import MeteredFakeClient
 from tests.precision_fixtures import PrecisionHandler as Handler
 from tests.precision_fixtures import artifact as _artifact
+from tests.precision_fixtures import is_synthesis
 from tests.precision_fixtures import precision_config as _config
 from tests.precision_fixtures import precision_plan as _plan
 from tests.precision_fixtures import precision_store as _store
@@ -105,7 +106,7 @@ def test_failure_receipt_storage_error_blocks_retries_but_preserves_interrupts(
         response = handler(messages, tier, json_mode)
         task_message = next(m for m in messages if "Task (JSON):\n" in m["content"])
         task = json.loads(task_message["content"].split("Task (JSON):\n")[1])
-        if "drafts" in task:
+        if is_synthesis(task):
             if failure == "invalid_output":
                 return '{"translations":[]}'
             if failure == "truncated":
@@ -202,7 +203,7 @@ def test_completed_paid_receipt_recovers_gap_before_stage_checkpoint(
         task_message = next(m for m in messages if "Task (JSON):\n" in m["content"])
         task = json.loads(task_message["content"].split("Task (JSON):\n")[1])
         with handler.lock:
-            if invalid and "drafts" in task:
+            if invalid and is_synthesis(task):
                 invalid = False
                 return '{"translations":[]}'
         return response

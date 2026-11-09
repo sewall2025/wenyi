@@ -339,11 +339,11 @@ pipeline:
 `translate` 命令的 `--polish`、`--no-polish`、`--review`、`--no-review`
 会覆盖对应配置。
 
-正文翻译只注入每批命中的词条，新 Reviewer 请求使用全量术语表，无范围选择开关。已有 YAML 或项目
+正文翻译只注入每批命中的词条，新 Reviewer 请求只注入每个审校块命中的词条，无范围选择开关。已有 YAML 或项目
 配置中的 `pipeline.glossary_scope` 必须删除；旧键即使取值为 `full` 也会报错。
 快照刷新、续跑行为及提示词大小取舍详见[术语库策略](pipeline.md#术语库)。
 
-可使用 `wenyi review INPUT` 独立执行最终审校。内容、配置、全量术语策略和术语库指纹
+可使用 `wenyi review INPUT` 独立执行最终审校。内容、配置、命中术语策略和术语库指纹
 匹配时，复用已完成结果或续跑未完成工作；否则新建 Review。默认会在影子循环后发布折叠后的修订；可用 `--no-autofix` 保持本次只读，
 或在配置关闭时用 `--autofix` 强制发布。Autofix 会先应用折叠后的 changes，再让最终未解决
 issues 复用同一套 Agent Loop 和 Fixer，不会另建一套 Autofix loop 或 prompt。
@@ -378,6 +378,7 @@ output:
 ```yaml
 segment:
   max_tokens_per_batch: 1800
+  max_segments_per_batch: 6
   max_tokens_per_segment: 1200
 
 honorific:
@@ -388,6 +389,7 @@ paths:
 ```
 
 - `max_tokens_per_batch`：单个模型翻译批次的源文 token 预算，使用 tiktoken `cl100k_base` 计数（通用估算，不等于线上提供商私有分词器）。必须至少为 1。
+- `max_segments_per_batch`：单个翻译批次（标准与精翻）的最大段数。与 `max_tokens_per_batch` 同时生效，先达到哪个就在哪里切批；批次小一些可避免模型数错段 id。默认 6，必须至少为 1。修改任一上限会重新切分待译批次：已保存译文保留并跳过，旧切法下的精翻检查点和候选不会复用到新批次。
 - `max_tokens_per_segment`：超长段落按句拆分的 token 阈值。`0` 表示禁用拆分。
 - `honorific.strategy`：日语源文本的敬称处理策略，可选 `keep_style`、`normalize`、`drop`。
 - `state_dir`：书籍断点、章节产物、术语库、用量和报告的位置。

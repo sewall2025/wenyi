@@ -73,12 +73,14 @@ class ReviewChunkService:
         """Review contiguous chapter blocks in parallel and return chapter-local issue indices.
         Use blocks around three translation batches to reduce calls and repeated context.
         Convert valid block-local indices by the block offset and reject invalid positions.
-        Supply the full glossary to every fresh reviewer request and share the same
-        snapshot across workers. Completed chunks and initial traces bypass model calls.
+        Each fresh reviewer request receives only the snapshot entries its source text cites
+        (``GlossaryStore.terms_in``, snapshot order); the evidence loop still looks up the full
+        snapshot. Completed chunks and initial traces bypass model calls.
         Read fixed target/glossary snapshots. Recursively bisect malformed output and retry
         single paragraphs a bounded number of times. Requests that exceed the model context
-        are bisected too; a single paragraph is retried with only the glossary entries it
-        cites and is otherwise skipped (``review_chunk_skipped``) so the run continues.
+        are bisected too; a single paragraph that still does not fit is skipped
+        (``review_chunk_skipped``) so the run continues.
+        Truncated replies bisect like malformed output; a truncated paragraph is skipped.
         Merge results in original block order for determinism.
         """
         budget = self._config.segment.max_tokens_per_batch * 3
@@ -122,7 +124,6 @@ class ReviewChunkService:
             chunk: list,
             *,
             attempt: int = 1,
-            glossary: list[GlossaryTerm] | None = None,
         ) -> list[dict]:
             """Run one review call and map valid block-local indices to chapter indices."""
             srcs = [s.source for s in chunk]
@@ -245,7 +246,7 @@ class ReviewChunkService:
                     review_result = self._reviewer.review_result(
                         srcs,
                         tgts,
-                        terms if glossary is None else glossary,
+                        GlossaryStore.terms_in(terms, "\n".join(srcs)),
                         trace=trace if debug is not None else None,
                     )
                 except Exception as error:
@@ -378,6 +379,9 @@ class ReviewChunkService:
                         chunk_base + mid, chunk[mid:]
                     )
 
+                if error.reason == "truncated_response":
+                    # Resending the same paragraph cannot raise the output cap.
+                    return skip_singleton(chunk_base, chunk, reason=error.reason)
                 last_error = error
                 retries = self._config.pipeline.review_output_retries
                 for attempt in range(1, retries + 1):
@@ -428,19 +432,20 @@ class ReviewChunkService:
                 return review_adaptive(chunk_base, chunk[:mid]) + review_adaptive(
                     chunk_base + mid, chunk[mid:]
                 )
-            cited = GlossaryStore.terms_in(terms, chunk[0].source)
-            if len(cited) < len(terms):
-                try:
-                    return review_once(chunk_base, chunk, glossary=cited)
-                except ReviewContextOverflow as retry_overflow:
-                    overflow = retry_overflow
+            # The request already carried only the cited entries; nothing smaller remains.
+            return skip_singleton(
+                chunk_base, chunk, reason="context_length", trigger=overflow.trigger
+            )
+
+        def skip_singleton(chunk_base: int, chunk: list, *, reason: str, **detail: Any) -> list:
+            """Skip one paragraph visibly and cache the skip so resume does not resend it."""
             buffer_event(
                 "review_chunk_skipped",
                 start_index=chunk_base,
                 count=1,
                 segment=chunk[0].index,
-                reason="context_length",
-                trigger=overflow.trigger,
+                reason=reason,
+                **detail,
             )
             if debug is not None and chapter_index is not None:
                 # Cache the skip so resume does not resend a request known not to fit.
@@ -455,7 +460,7 @@ class ReviewChunkService:
                             "round": review_round,
                             "chapter": chapter_index,
                             "segment": chunk[0].index,
-                            "reason": "context_length",
+                            "reason": reason,
                         },
                     },
                 )

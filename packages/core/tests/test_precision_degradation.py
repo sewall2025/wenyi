@@ -16,9 +16,9 @@ from wenyi_core.pipeline.translate import precision as precision_run
 from tests.fake_llm import METERED_TOTAL_TOKENS, MeteredFakeClient
 from tests.precision_fixtures import PrecisionHandler as Handler
 from tests.precision_fixtures import artifact as _artifact
+from tests.precision_fixtures import is_synthesis, segment_ids
 from tests.precision_fixtures import precision_config as _config
 from tests.precision_fixtures import precision_store as _store
-from tests.precision_fixtures import segment_ids
 
 
 def inputs(*sources):
@@ -132,8 +132,8 @@ def test_failed_draft_segment_is_synthesized_from_the_other_drafts(tmp_path, mon
 
     def respond(messages, tier, json_mode):
         task = task_in(messages)
-        if "drafts" not in task:
-            if segment_ids(task) == [0, 1] and not isinstance(task["segments"][0], dict):
+        if not is_synthesis(task):
+            if segment_ids(task) == [0, 1]:
                 state["draft"] += 1
             if state["draft"] == 1:
                 if segment_ids(task) == [1]:
@@ -146,7 +146,7 @@ def test_failed_draft_segment_is_synthesized_from_the_other_drafts(tmp_path, mon
     segments = store.load_chapter(0).text_segments
     assert [s.target for s in segments] == ["润1:0", "润1:1"]
     synthesis = [c for c in client.calls if c["operation"] == "polish.body"]
-    assert [sum("1" in d for d in task_in(c["messages"])["drafts"]) for c in synthesis] == [2]
+    assert [len(task_in(c["messages"])["segments"][-1]["drafts"]) for c in synthesis] == [2]
     assert segments[1].target_before_polish.startswith("译")
     degraded = _events(store, "precision_segment_degraded")
     assert [(e["segment"], e["stage"], e["fallback"], e["reason"]) for e in degraded] == [
@@ -165,7 +165,7 @@ def test_segment_without_drafts_uses_standard_translation_or_is_refused(tmp_path
             assert not json_mode
             return "「标准稿」" if standard_ok else "  "
         task = task_in(messages)
-        if "drafts" not in task and 1 in segment_ids(task):
+        if not is_synthesis(task) and 1 in segment_ids(task):
             reply = json.loads(base(messages, tier, json_mode))
             reply["translations"].pop("1")
             return json.dumps(reply) if reply["translations"] else '{"translations":[]}'
@@ -210,8 +210,8 @@ def test_segment_without_drafts_uses_standard_translation_or_is_refused(tmp_path
     ]
     # Only the refused segment is batched again: three drafts plus one synthesis.
     assert len(precision_calls) == 4
-    assert all('"two"' in c["messages"][1]["content"] for c in precision_calls)
-    assert all('"one"' not in c["messages"][1]["content"] for c in precision_calls)
+    assert all('"two"' in c["messages"][-1]["content"] for c in precision_calls)
+    assert all('"one"' not in c["messages"][-1]["content"] for c in precision_calls)
 
 
 def test_interrupted_synthesis_resumes_without_rebuying_accepted_segments(tmp_path):
@@ -220,7 +220,7 @@ def test_interrupted_synthesis_resumes_without_rebuying_accepted_segments(tmp_pa
 
     def respond(messages, tier, json_mode):
         task = task_in(messages)
-        if "drafts" in task:
+        if is_synthesis(task):
             with lock:
                 synthesis.append(segment_ids(task))
                 count = len(synthesis)
@@ -287,7 +287,7 @@ def test_oversized_synthesis_keeps_two_drafts_then_adopts_one():
     drafts = [["a"], ["b"], ["c"]]
 
     def two_fit(messages, tier, json_mode):
-        if len(task_in(messages)["drafts"]) > 2:
+        if len(task_in(messages)["segments"][0]["drafts"]) > 2:
             raise _overflow()
         return json.dumps({"translations": {"0": "合"}})
 
@@ -295,7 +295,7 @@ def test_oversized_synthesis_keeps_two_drafts_then_adopts_one():
     trims = _trims(client)
     assert worker.synthesize(inputs("Source."), drafts) == ["合"]
     assert trims == ["context", "drafts_2"]
-    assert len(task_in(client.calls[-1]["messages"])["drafts"]) == 2
+    assert len(task_in(client.calls[-1]["messages"])["segments"][0]["drafts"]) == 2
 
     def never_fits(messages, tier, json_mode):
         raise _overflow()
@@ -309,7 +309,7 @@ def test_oversized_synthesis_keeps_two_drafts_then_adopts_one():
 
 def test_oversized_draft_segment_drops_context_before_standard_fallback():
     def no_context(messages, tier, json_mode):
-        if '"prior"' in messages[1]["content"]:
+        if '"prior"' in messages[-1]["content"]:
             raise _overflow()
         return _echo(messages, tier, json_mode)
 

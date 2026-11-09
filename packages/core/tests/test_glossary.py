@@ -223,5 +223,49 @@ class TestGlossary(unittest.TestCase):
         )
 
 
+def test_normalize_aliases_drops_duplicates_source_and_rejoined_lists():
+    from wenyi_core.glossary.store import normalize_aliases
+
+    aliases = [
+        "Athena",
+        " athena  liu ",
+        "Athena Wong",
+        "Athena, Athena Liu, Athena Wong",
+        "ATHENA WONG",
+        "",
+        "Instagram, 雅典娜的",
+    ]
+    assert normalize_aliases("Athena Liu", aliases) == [
+        "Athena",
+        "Athena Wong",
+        "Instagram, 雅典娜的",
+    ]
+    assert normalize_aliases("Athena", ["Athena Wong", "Athena Wong, Athena Wong"]) == [
+        "Athena Wong"
+    ]
+
+
+def test_upsert_merge_does_not_grow_rejoined_aliases(tmp_path):
+    store = GlossaryStore(str(tmp_path / "g.db"))
+    try:
+        store.upsert_term(GlossaryTerm("Athena", "Athena", aliases=["Athena Wong"]))
+        store.upsert_term(
+            GlossaryTerm("Athena", "Athena", aliases=["Athena Wong, Athena Wong", "athena"])
+        )
+        assert store.get_term("Athena").aliases == ["Athena Wong"]
+    finally:
+        store.close()
+
+
+def test_rendered_glossary_and_review_evidence_deduplicate_stored_aliases():
+    from wenyi_core.agents.prompts import render_glossary
+    from wenyi_core.review.evidence import BookEvidenceIndex
+
+    term = GlossaryTerm("Athena", "Athena", aliases=["Athena Wong", "Athena Wong, Athena Wong"])
+    assert render_glossary([term], source_lang="en").endswith("[Aliases:  Athena Wong]")
+    result = BookEvidenceIndex([], [term], {}, source_lang="en").glossary_term({"term": "Athena"})
+    assert result["term"]["aliases"] == ["Athena Wong"]
+
+
 if __name__ == "__main__":
     unittest.main()

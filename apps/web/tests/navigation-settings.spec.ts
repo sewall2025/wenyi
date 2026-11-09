@@ -25,11 +25,13 @@ test("project settings retain creation-time precision without a mode selector", 
   await page.locator("summary").filter({ hasText: "Segmentation and performance" }).click();
   await expect(page.getByLabel("Parallel initial drafts (1–3)")).toHaveCount(0);
   await page.getByLabel("Tokens per batch", { exact: true }).fill("1400");
+  await page.getByLabel("Segments per batch", { exact: true }).fill("4");
   await page.getByRole("button", { name: "Validate configuration", exact: true }).click();
   expect(submitted?.pipeline.translation_mode).toBe("best_of_three");
   expect(submitted?.pipeline.polish).toBe(true);
   expect(submitted?.pipeline.precision_concurrency).toBeUndefined();
   expect(submitted?.segment.max_tokens_per_batch).toBe(1400);
+  expect(submitted?.segment.max_segments_per_batch).toBe(4);
   await expect(page.getByLabel("Polishing", { exact: true })).toBeDisabled();
 });
 

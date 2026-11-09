@@ -162,14 +162,16 @@ class TranslationBatchExecutor:
         return BatchResult(tuple(targets), before_polish, degraded=tuple(refused))
 
 
-def resume_batches(segments: list[Segment], max_tokens: int) -> list[list[Segment]]:
-    """Split token-budget batches again at completed/pending boundaries.
-    A changed budget may mix saved translations and unset targets in one batch. Group by
+def resume_batches(
+    segments: list[Segment], max_tokens: int, max_segments: int | None = None
+) -> list[list[Segment]]:
+    """Split token/segment-capped batches again at completed/pending boundaries.
+    A changed budget or segment cap may mix saved translations and unset targets in one batch. Group by
     completion state to translate only missing paragraphs and avoid overwriting confirmed
     content. A saved blank string is complete; only None means pending.
     """
     batches: list[list[Segment]] = []
-    for raw_batch in batch_segments(segments, max_tokens):
+    for raw_batch in batch_segments(segments, max_tokens, max_segments):
         current: list[Segment] = []
         current_done: bool | None = None
         for segment in raw_batch:

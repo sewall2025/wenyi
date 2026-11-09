@@ -15,8 +15,13 @@ from tests.fake_llm import routing_handler
 
 
 def segment_ids(task):
-    """Requested ids of a precision task; repair requests quote ``{"id", "source"}`` items."""
-    return [item["id"] if isinstance(item, dict) else item for item in task["segments"]]
+    """Requested ids of a precision task; every item is ``{"id", "source", ...}``."""
+    return [item["id"] for item in task["segments"]]
+
+
+def is_synthesis(task):
+    """Synthesis tasks attach the distinct drafts to each segment."""
+    return "drafts" in task["segments"][0]
 
 
 def precision_config(tmp_path: Path) -> Config:
@@ -89,9 +94,9 @@ class PrecisionHandler:
         )
         if task_message is None:
             return routing_handler(messages, tier, json_mode)
-        sources = json.loads(messages[1]["content"].split("\n", 1)[1])["sources"]
         task = json.loads(task_message["content"].split("Task (JSON):\n")[1])
-        kind = "synthesis" if "drafts" in task else "translate"
+        sources = {item["id"]: item["source"] for item in task["segments"]}
+        kind = "synthesis" if is_synthesis(task) else "translate"
         with self.lock:
             self.counts[kind] += 1
             sample = self.counts[kind]

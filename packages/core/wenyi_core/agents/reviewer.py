@@ -12,7 +12,7 @@ from typing import Any
 from ..errors import WenyiError
 from ..ingest.tokens import count_tokens
 from ..llm.json_parser import parse_json_result
-from ..llm.retrying import ContextLengthExceeded
+from ..llm.retrying import ContextLengthExceeded, TruncatedResponseError
 from . import prompts
 from .base import Agent
 
@@ -100,6 +100,11 @@ class Reviewer(Agent):
             if trace:
                 trace("error", {"error_type": type(error).__name__, "error": str(error)})
             raise ReviewContextOverflow("context_length") from error
+        except TruncatedResponseError as error:
+            # Includes the router's safe wrapper; a smaller input is the only remedy.
+            if trace:
+                trace("error", {"error_type": type(error).__name__, "error": str(error)})
+            raise ReviewOutputError("truncated_response") from error
         except Exception as error:
             if trace:
                 trace(

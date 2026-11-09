@@ -199,14 +199,22 @@ def load_document(
     return doc
 
 
-def batch_segments(segments: list[Segment], max_tokens: int) -> list[list[Segment]]:
-    """Group segments into batches by shared token budget (tiktoken cl100k_base)."""
+def batch_segments(
+    segments: list[Segment], max_tokens: int, max_segments: int | None = None
+) -> list[list[Segment]]:
+    """Group segments by shared token budget (tiktoken cl100k_base) and optional segment cap.
+
+    A batch closes at whichever limit is reached first.
+    """
     batches: list[list[Segment]] = []
     cur: list[Segment] = []
     cur_tokens = 0
     for s in segments:
         slen = count_tokens(s.source)
-        if cur and cur_tokens + slen > max_tokens:
+        if cur and (
+            cur_tokens + slen > max_tokens
+            or (max_segments is not None and len(cur) >= max_segments)
+        ):
             batches.append(cur)
             cur, cur_tokens = [], 0
         cur.append(s)

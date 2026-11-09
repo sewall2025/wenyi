@@ -130,8 +130,9 @@ def test_default_polisher_preserves_original_resource_and_fingerprint():
     "phase,fingerprint",
     [
         ("analysis", "395155e77e13b4da88691410724aaa83b5f924b9b8afb6690c196aed969af139"),
-        # Includes the plain-text segment_translator fallback templates.
-        ("translation", "6485d5d56f1f2a97026b759cf5caf4b372b25f086c0a0438ded993f9b6b21417"),
+        # Includes the plain-text segment_translator fallback templates and the
+        # glossary_extractor_system admission revision (fixed_expression scope, type enum).
+        ("translation", "71a7c1525629b410fe1b9c8ed824547f5e1cdcdcd34f7cedb75e306afb2b9064"),
         ("review", "6297d2547a9a32893e34291f22051e3d3dfda78fefa80ff3c5b784e938139611"),
         ("export", "d4de743d62c14ff316fee9bcb27075cae1f7f260a3cf9cf056914ed022d47fe6"),
     ],

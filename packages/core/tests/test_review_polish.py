@@ -390,8 +390,8 @@ class TestReviewer(unittest.TestCase):
         self.assertEqual([it["index"] for it in issues], [0, 1])
         self.assertEqual([it["detail"] for it in issues], ["甲", "乙"])
 
-    def test_review_blocks_share_full_glossary_after_cache_lookup(self):
-        """Cached blocks make no request; pending blocks include absent glossary entries."""
+    def test_review_blocks_receive_cited_glossary_after_cache_lookup(self):
+        """Cached blocks make no request; pending blocks carry only the entries they cite."""
         for cache_kind in ("none", "chunk", "initial", "all"):
             with self.subTest(cache_kind=cache_kind):
                 cfg = _cfg()
@@ -402,7 +402,7 @@ class TestReviewer(unittest.TestCase):
 
                 def handler(messages, tier, json_mode):
                     barrier.wait(timeout=2)
-                    self.assertIn("Unused → Unused", messages[-1]["content"])
+                    self.assertNotIn("Unused", messages[-1]["content"])
                     return _review_response([], 1)
 
                 orch = Orchestrator(cfg, client=FakeClient(handler=handler))
@@ -446,10 +446,11 @@ class TestReviewer(unittest.TestCase):
 
                 self.assertEqual(issues, [])
                 self.assertEqual(completed, [1, 1])
-                matching.assert_not_called()
+                self.assertEqual(matching.call_count, expected_calls)
                 self.assertEqual(reviewing.call_count, expected_calls)
                 for call in reviewing.call_args_list:
-                    self.assertIs(call.args[2], terms)
+                    cited = [term.source for term in call.args[2]]
+                    self.assertEqual(cited, [call.args[0][0].split()[0]])
 
 
 class TestPolisher(unittest.TestCase):

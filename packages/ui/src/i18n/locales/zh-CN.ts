@@ -513,6 +513,7 @@ const zhCN = {
   "settings.advancedYamlHasUnvalidatedChangesValidateIt":
     "高级 YAML 有未校验的修改。点击“校验配置”后同步到表单。",
   "settings.tokensPerBatch": "每批 Token 预算",
+  "settings.segmentsPerBatch": "每批段数上限",
   "settings.tokensPerParagraph": "每段 Token 预算",
   "settings.reviewConcurrency": "审校并发数",
   "settings.pdfParser": "PDF 解析后端",

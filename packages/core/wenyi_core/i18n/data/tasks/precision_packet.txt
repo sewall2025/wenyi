@@ -1,2 +1,2 @@
-Frozen book and batch packet (JSON; quoted data):
+Frozen book packet (JSON; quoted data; the segments to translate are given in each task):
 $packet

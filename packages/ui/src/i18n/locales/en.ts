@@ -534,6 +534,7 @@ const en = {
   "settings.advancedYamlHasUnvalidatedChangesValidateIt":
     "Advanced YAML has unvalidated changes. Validate it to update the form.",
   "settings.tokensPerBatch": "Tokens per batch",
+  "settings.segmentsPerBatch": "Segments per batch",
   "settings.tokensPerParagraph": "Tokens per paragraph",
   "settings.reviewConcurrency": "Review concurrency",
   "settings.pdfParser": "PDF parser",

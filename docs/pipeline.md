@@ -60,6 +60,8 @@ The pure `i18n/policy/` resolver separates source and target bindings, exact pai
 
 ## Whole-book understanding and context
 
+Chapters are cut into batches by two limits that apply together: `segment.max_tokens_per_batch` source tokens and `segment.max_segments_per_batch` paragraphs (default 6). A batch closes at whichever limit is reached first; standard and best-of-three translation share the same cut. Resume splits batches again at completed/pending boundaries, so saved targets are skipped. Changing either limit changes the cut of pending batches: their best-of-three checkpoints are keyed by start and length, so checkpoints from the old cut are left untouched and not reused, and those batches are requested again.
+
 The prescan creates a digest for each chapter and a synopsis of the complete book. For every translation batch, the prompt presents stable information first: style guidance, the whole-book synopsis, the current chapter digest, the glossary entries cited by the batch, any source-language notes referenced by the current segments, recent translated context, the source text to translate, and one following source segment. Recent translation therefore remains immediately adjacent to the new source passage.
 
 This lets early chapters benefit from knowledge of later events while helping adjacent batches preserve pronouns, forms of address, tone, and sentences that span multiple source segments.
@@ -108,7 +110,7 @@ misclassification. Offline tests do not establish a model-quality improvement.
 
 ## Glossary
 
-Preparation analyzes style and character voices without proposing name translations or extracting glossary entries. As translation proceeds, Wenyi extracts and updates people, places, organizations, terms, techniques, recurring expressions, and forms of address from completed source-and-target pairs. Existing project terms, including imports and earlier automatically seeded entries, remain unchanged by preparation on resume. By default, without imported terms, the first body-translation batch starts with an empty glossary: this avoids locking in sample-based guesses, but gives that batch no predefined terminology mappings. The optional terminology-evidence mode described below can admit discovered candidates before a pending body batch. Every body-translation request (standard translation, both best-of-three stages, and standalone polishing) receives only the glossary entries whose source form or confirmed alias occurs in the batch's source paragraphs or in their source-language annotations. Matching uses the shared glossary matcher: case- and width-insensitive whole words for Latin, Greek and Cyrillic scripts, substrings for CJK, ruby markers removed, and source-only matching for forms of address, speech patterns and fixed expressions. Recent translated context is target-language text and the following source paragraph is reference only, so neither selects entries. Cited entries keep glossary insertion order, so the same batch and glossary always produce the same prompt and fingerprint. Fresh Reviewer requests share the complete final glossary snapshot across chapters and workers. After extraction changes the glossary, translation refreshes its snapshot before the next pending batch; completed batches keep their saved targets. If interruption occurs after targets are saved but before extraction is checkpointed, resume completes extraction before translating the next batch. Checkpointed batches skip both translation and extraction.
+Preparation analyzes style and character voices without proposing name translations or extracting glossary entries. As translation proceeds, Wenyi extracts and updates people, places, organizations, terms, techniques, recurring expressions, and forms of address from completed source-and-target pairs. Existing project terms, including imports and earlier automatically seeded entries, remain unchanged by preparation on resume. By default, without imported terms, the first body-translation batch starts with an empty glossary: this avoids locking in sample-based guesses, but gives that batch no predefined terminology mappings. The optional terminology-evidence mode described below can admit discovered candidates before a pending body batch. Every body-translation request (standard translation, both best-of-three stages, and standalone polishing) receives only the glossary entries whose source form or confirmed alias occurs in the batch's source paragraphs or in their source-language annotations. Matching uses the shared glossary matcher: case- and width-insensitive whole words for Latin, Greek and Cyrillic scripts, substrings for CJK, ruby markers removed, and source-only matching for forms of address, speech patterns and fixed expressions. Recent translated context is target-language text and the following source paragraph is reference only, so neither selects entries. Cited entries keep glossary insertion order, so the same batch and glossary always produce the same prompt and fingerprint. Inactive candidates (see below) are never cited. Fresh Reviewer requests (`review.scan`) use the same rule against the final glossary snapshot shared across chapters and workers: each chunk receives only the entries its source paragraphs cite. After extraction changes the glossary, translation refreshes its snapshot before the next pending batch; completed batches keep their saved targets. If interruption occurs after targets are saved but before extraction is checkpointed, resume completes extraction before translating the next batch. Checkpointed batches skip both translation and extraction.
 
 The glossary owns character name mappings. The style brief retains source identities,
 gender, and descriptive character notes, but does not repeat translated names from the
@@ -133,7 +135,11 @@ so older cached work may require fresh model calls; historical artifacts remain 
 This trades inferred reading coverage for less unsupported pronunciation guidance;
 offline tests do not establish model quality.
 
-Cited-entry injection keeps batch prompts proportional to the batch instead of the whole glossary; on a 515-entry book glossary a 31-paragraph batch drops from about 28K glossary tokens to about 0.5K. The selection is fixed (no scope selector): `pipeline.glossary_scope` has been removed, and configuration containing that key is rejected and must be edited explicitly. Upgrading changes the prompt and best-of-three fingerprints of pending batches, so unfinished batches are requested again; completed batches keep their saved targets and are skipped. With `pipeline.terminology_context` enabled, the style prefix still lists every person entry by source form and gender (no translations), unchanged. Glossary consistency checks, conflict arbitration and Review use the full glossary as before.
+Cited-entry injection keeps batch prompts proportional to the batch instead of the whole glossary; on a 515-entry book glossary a 31-paragraph batch drops from about 28K glossary tokens to about 0.5K. The selection is fixed (no scope selector): `pipeline.glossary_scope` has been removed, and configuration containing that key is rejected and must be edited explicitly. Upgrading changes the prompt and best-of-three fingerprints of pending batches, so unfinished batches are requested again; completed batches keep their saved targets and are skipped. With `pipeline.terminology_context` enabled, the style prefix still lists every person entry by source form and gender (no translations), unchanged. Chapter and TOC title requests also carry only the entries their titles cite. Glossary consistency checks and conflict arbitration read the stored glossary as before. Review screening injects only cited entries; the Review evidence tools (`glossary_term` and related lookups) still query the stored snapshot on demand. On a 1,011-entry glossary a two-paragraph Review chunk drops from about 46.9K prompt tokens to about 1.2K.
+
+Automatic extraction (post-batch extraction, the chapter-end fallback and pretranslation person discovery) passes every proposal through the pure rules in `glossary/admission.py` before it is stored. A proposal is rejected when its source is empty or contains a line break or control character; its type is outside the extraction enum (`person`, `place`, `organization`, `term`, `technique`, `item`, `setting`, `appellation`, `honorific`, `speech`, `fixed_expression`; other values such as `statement` or `other` are rejected rather than remapped); it ends with `.`, `!`, `?`, `…`, `。`, `！` or `？` (abbreviations such as `Jr.` or `D.C.` are exempt); it is two or more all-caps Latin words (a heading); it is longer than 8 words for `person`/`place`/`organization`/`item`, 5 words for other types, or 16 characters for CJK text; or a multi-word proposal equals a source paragraph of its batch (single-word names are exempt). Rejections are counted per reason in the `batch_glossary_extracted` and `chapter_glossary_extracted` summaries (`rejected`, `rejected_<reason>`) and in `terminology_candidates_rejected`. Entries entered by hand, through the API or UI, or by import are never filtered.
+
+People, places and organizations take effect on first sight. Every other type must occur at least twice in the whole book source, counted with the shared glossary matcher (NFKC, casefold, curly quotes folded to ASCII, word boundaries for Latin, Greek and Cyrillic). Until then the entry is stored with `status: candidate`: it stays in the glossary and its listings but is left out of every translation, polishing, title and Review prompt and out of the extraction reference. A later extraction of the same mapping after the source repeats it promotes it to `ok`; a conflicting proposal records the conflict and leaves it a candidate; nothing demotes an established entry. The `status` column already exists, so SQLite and PostgreSQL databases need no migration and existing entries stay active. Editing an entry by hand sets it to `ok`.
 
 If analysis, glossary extraction, or historical term alignment returns a collection with an invalid type, Wenyi ignores that collection and logs a warning with the operation, field, and actual type. Arrays retain object members and log the number of discarded non-object members. Missing or null fields and valid empty arrays do not produce collection-shape warnings. These diagnostics use the CLI/worker's standard Python logs, exclude source text and model response content, and help identify missing candidates without interrupting translation.
 
@@ -159,7 +165,7 @@ Discovery caches include the current glossary snapshot; editing a mapping or ali
 
 This standalone evidence-only branch uses cache protocol version 4. Request and publication caches from the earlier combined experiment are not reused. There is no old-cache cleanup or completed-target rewrite, but the first enabled run on this branch may incur fresh evidence calls.
 
-Admission preserves existing translations of terms; a different suggestion enters the conflict workflow. Nonempty local fields without provenance are conservatively treated as manual, and edits to managed fields remain protected. Full glossary mappings are unchanged. Translator (including best-of-three), Polisher, Reviewer, and Fixer prompts additionally receive relevant notes selected as whole entries within a budget, never cut mid-sentence. These notes are read-only evidence, not instructions or permission to add identities, relationships, or plot absent from the current source.
+Admission preserves existing translations of terms; a different suggestion enters the conflict workflow. Nonempty local fields without provenance are conservatively treated as manual, and edits to managed fields remain protected. Stored glossary mappings are unchanged. Translator (including best-of-three), Polisher, Reviewer, and Fixer prompts additionally receive relevant notes selected as whole entries within a budget, never cut mid-sentence. These notes are read-only evidence, not instructions or permission to add identities, relationships, or plot absent from the current source.
 
 Evidence and merge reference validation distinguishes missing citations (`missing`) from IDs outside the supplied input (`outside_input`) and identifies the failing operation and field. These are semantic response failures, not provider truncation. The affected batch stops without publishing the failed result or adding automatic paid correction requests. A safe diagnostic is saved at `terminology/diagnostics/<kind>/<request-hash>.json` and appended as `terminology_reference_validation_failed` in the event ledger. It contains only operation/field identifiers, aggregate reference counts and the request-cache key—not source text, model prose or untrusted reference strings. Retry reuses successful requests and paid preparation caches; a diagnostic is never treated as successful evidence. Earlier failures without diagnostics cannot be reconstructed retroactively.
 
@@ -205,16 +211,17 @@ errors (for example HTTP 402) leave the run as `interrupted`. Local/protocol fai
 still finish as `failed` for diagnosis, but both `interrupted` and `failed` remain
 resume-eligible so the next `review` continues the same directory instead of starting a
 new one. Otherwise, a new whole-book Review starts. Cached chunks and completed initial screening skip model calls; pending Reviewer
-requests use the same full glossary snapshot. Review reuse and resume compare the
-full-glossary policy marker and every glossary field, including aliases, pronunciation,
+requests take their cited entries from the same glossary snapshot. Review reuse and resume compare the
+cited-glossary policy marker (`review_glossary_policy: cited`) and every glossary field of the whole snapshot, including aliases, pronunciation,
 gender, notes, and entry order. Any mismatch starts a new Review; caches created before
 this policy are preserved but not reused. A finished shadow-fixer trace is also reused after an interrupted round commit when the round, segment, issue IDs and current-target hash still match; that completed revision is not requested or charged again. Resume also restores earlier rounds’ issue summaries and reconnects active patches to their history records, keeping final counts consistent with an uninterrupted run.
 
 Reviewer system instructions are invariant across chunk sizes. The actual paragraph
-count and paragraph pairs appear only after the full glossary in the user message.
+count and paragraph pairs appear only after the cited glossary entries in the user message.
 The response must still contain the exact `reviewed_segments` count and `complete:true`;
 the validation is unchanged. This removes an avoidable prefix-cache obstacle without
-filtering glossary coverage or adding provider-specific cache markers. Provider cache
+adding provider-specific cache markers; because the glossary section now varies per chunk, the
+shared prefix is the system message. Provider cache
 hits are not guaranteed. The template change follows the existing language-policy
 fingerprint rules, so older Review caches may require fresh calls; saved translations
 and historical artifacts remain intact.
@@ -298,13 +305,26 @@ not an independently verified accuracy guarantee. There is no accuracy judge,
 three-way polishing, blind acceptance, refinement round or per-paragraph competition.
 Structural validation supports EPUB/DOCX backfill and never silently zips away text.
 
-Each request lists the wanted paragraph ids in `task.segments` (positions in the frozen
-batch sources). The first request for a batch lists bare ids; repair rounds and
-one-paragraph requests list `{"id": 21, "source": "<full source paragraph>"}` items,
-because models miscount positions when they only get ids. Context, the chapter digest
-and `next_source` are reference only. The model returns
-`{"translations": {"<id>": "<translation>"}}` without echoing the source. Wenyi checks
-every id separately and leaves an id unresolved when:
+Every request, including the first one for a batch, lists each wanted paragraph in
+`task.segments` as `{"id": 21, "source": "<full source paragraph>"}`; synthesis adds the
+distinct drafts of that paragraph as `"drafts": [...]`. An id is only the label given in
+`task.segments`, never a position, and the frozen packet no longer carries a positional
+`sources` array. The chapter digest, recent context and `next_source` follow the segments
+in `task.reference_only`, unnumbered and marked as reference only. The model returns
+`{"translations": {"<id>": "<translation>"}}` without echoing the source.
+
+Wenyi first judges the reply as a whole. It uses no entry of it, writes a
+`precision_reply_misaligned` event (`operation`, `ids`, `reason`) and continues with the
+feedback retry or halving path below when:
+
+- `unrequested_id`: the reply contains an id that was not requested (for example a
+  numbered context paragraph or `next_source`);
+- `context_echo`: the first requested entry restates the last context paragraph
+  (normalized similarity ≥ 0.8);
+- `missing_target_script`: more than half of the translatable entries contain no letter of
+  the target language's scripts (see below).
+
+Otherwise it checks every id separately and leaves an id unresolved when:
 
 - its text is not a string (including old `{"src", "text"}` objects), or is blank unless
   empty translations are allowed;
@@ -315,16 +335,22 @@ every id separately and leaves an id unresolved when:
   repetition loop);
 - with different source and target languages and more than one paragraph requested, its
   normalized text equals its normalized source (an untranslated copy). A one-paragraph
-  request accepts copies, so names, codes or URLs cannot pause a batch.
+  request accepts copies, so names, codes or URLs cannot pause a batch;
+- it has at least five letters, none in the target language's scripts, and is not its
+  own source. Scripts come from the `scripts` field of the language profiles (for example
+  `Han`; `Han`, `Hiragana`, `Katakana`; `Hangul`; `Cyrillic`; `Latin`). The rule is skipped
+  when the source already uses every target script, such as en→fr;
+- its normalized text equals the source of the previous or next paragraph;
+- it belongs to a run of at least two consecutive entries that match the same neighbour's
+  source clearly better than their own, judged by numbers, `?`/`!`, quotes, kept Latin
+  names and length ratio. Sources shorter than 20 normalized characters (titles, short
+  dialogue) are never judged and break a run.
 
 Paragraphs without letters are restored from the source and never take part in these
-checks. Unrequested ids (such as a translated `next_source`) are always dropped without
-affecting other entries; a duplicate key only leaves that id unresolved, and omitted ids
-are handled by the gap rule above. A legacy bare array is accepted by position only when
-it is not longer than the request and covers every translatable id; otherwise the whole
-reply is discarded.
+checks. A legacy bare array is accepted by position only when it is not longer than the
+request and covers every translatable id; otherwise the whole reply is discarded.
 Rejected entries are never written to the result. Unresolved ids, and only those ids, are
-requested again with the same frozen packet plus their quoted sources in the task, so
+requested again with the same frozen packet and their quoted sources in the task, so
 prompt-cache prefixes stay stable; synthesis resends only the valid drafts for those ids.
 A request continues on its missing ids while it resolves at least one paragraph. A
 zero-progress, malformed or truncated multi-paragraph request is split into two halves,
@@ -495,12 +521,16 @@ flowchart TD
 - Other requests over the context window (estimated before sending or rejected by the
   provider) also shrink instead of stopping the run:
   - Review chunks (`review.scan`) are halved (`review_chunk_split` with
-    `reason=context_length`); a single paragraph is retried with only the glossary entries
-    it cites and is otherwise skipped (`review_chunk_skipped`, `reason=context_length`).
+    `reason=context_length`); a single paragraph, which already carries only the glossary
+    entries it cites, is skipped (`review_chunk_skipped`, `reason=context_length`).
     The skip is cached, so resume does not resend it, and the Review result lists such
-    paragraphs in `skipped_segments` (`summary.skipped_segment_count`).
-  - Title batches (`translation.title`) are halved (`titles_batch_split`); a single title is
-    retried with only the glossary entries it cites, then keeps its source title
+    paragraphs in `skipped_segments` (`summary.skipped_segment_count`). A reply truncated at
+    the output limit is treated like malformed output (`review_chunk_split` with
+    `reason=truncated_response`); a truncated single paragraph is not resent and is
+    skipped the same way with `reason=truncated_response`.
+  - Title batches (`translation.title`) are halved (`titles_batch_split`); every request
+    already carries only the glossary entries its titles cite, so a single title that still
+    does not fit keeps its source title
     (`titles_kept_source`), the existing fallback for an empty title translation.
   - Historical glossary alignment (`glossary.align_history`) halves its candidates; a
     single candidate that still does not fit stays deferred

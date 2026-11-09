@@ -24,7 +24,7 @@ def test_precision_structural_retry_finishes_without_manual_resume(desktop, stag
         if "Task (JSON):\n" not in messages[-1]["content"]:
             return response
         task = json.loads(messages[-1]["content"].split("Task (JSON):\n")[1])
-        kind = "synthesis" if "drafts" in task else "translate"
+        kind = "synthesis" if "drafts" in task["segments"][0] else "translate"
         # The handler's lock also serializes selection of the single failing draft.
         with handler.lock:
             if kind == stage and not failed:

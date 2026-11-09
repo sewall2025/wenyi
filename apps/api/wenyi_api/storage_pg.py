@@ -19,7 +19,12 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from wenyi_core.errors import WenyiError
-from wenyi_core.glossary.store import GlossaryStore, GlossaryTerm, search_term_page
+from wenyi_core.glossary.store import (
+    GlossaryStore,
+    GlossaryTerm,
+    normalize_aliases,
+    search_term_page,
+)
 from wenyi_core.models.document import Chapter, Document, Segment
 from wenyi_core.storage.run_store import ExportSnapshotStore, source_sha256
 
@@ -757,7 +762,7 @@ class PostgresStorage:
                         term.reading,
                         term.type,
                         term.gender,
-                        Jsonb(term.aliases),
+                        Jsonb(normalize_aliases(term.source, term.aliases)),
                         term.first_chapter if term.first_chapter is not None else chapter,
                         term.note,
                         term.status,
@@ -766,16 +771,18 @@ class PostgresStorage:
                 )
                 return "inserted"
             if existing.target == term.target:
-                aliases = sorted(set(existing.aliases) | set(term.aliases))
+                aliases = sorted(normalize_aliases(term.source, [*existing.aliases, *term.aliases]))
                 conn.execute(
                     """UPDATE glossary SET reading=COALESCE(NULLIF(%s,''),reading),
                     gender=COALESCE(NULLIF(%s,''),gender),aliases=%s,note=COALESCE(NULLIF(%s,''),note),
+                    status=CASE WHEN status='candidate' AND %s<>'candidate' THEN 'ok' ELSE status END,
                     updated_at=%s WHERE project_id=%s AND source=%s""",
                     (
                         term.reading,
                         term.gender,
                         Jsonb(aliases),
                         term.note,
+                        term.status,
                         now,
                         self.project_id,
                         term.source,
@@ -788,7 +795,8 @@ class PostgresStorage:
                 (self.project_id, term.source, existing.target, term.target, chapter, now),
             )
             conn.execute(
-                "UPDATE glossary SET status='conflict',updated_at=%s WHERE project_id=%s AND source=%s",
+                """UPDATE glossary SET status=CASE WHEN status='candidate' THEN status
+                ELSE 'conflict' END,updated_at=%s WHERE project_id=%s AND source=%s""",
                 (now, self.project_id, term.source),
             )
             return "conflict"

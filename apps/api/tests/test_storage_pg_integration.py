@@ -120,6 +120,15 @@ def test_glossary_order_conflict_and_batch_checkpoint(storage, tmp_path):
     assert storage.completed_batch_glossary_keys(0) == {"2:4"}
 
 
+def test_glossary_candidate_status_survives_conflict_and_promotes(storage, tmp_path):
+    initialize(storage, tmp_path)
+    storage.upsert_term(GlossaryTerm(source="Go on", target="继续", status="candidate"))
+    assert storage.upsert_term(GlossaryTerm(source="Go on", target="走吧")) == "conflict"
+    assert storage.get_term("Go on").status == "candidate"
+    assert storage.upsert_term(GlossaryTerm(source="Go on", target="继续")) == "unchanged"
+    assert storage.get_term("Go on").status == "ok"
+
+
 def test_glossary_display_pages_do_not_reorder_prompt_terms(storage):
     sources = ["𐀀", "中", "a", "Z", "\ue000", "Å"]
     for source in sources:

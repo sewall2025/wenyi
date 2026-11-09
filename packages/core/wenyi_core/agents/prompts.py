@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from ..glossary.store import GlossaryStore, GlossaryTerm
+from ..glossary.store import GlossaryStore, GlossaryTerm, normalize_aliases
 
 
 def render_glossary(
@@ -29,7 +29,8 @@ def render_glossary(
         if source_lang == "ja" and t.reading:
             extra.append(f"Pronunciation: {t.reading}")
         tag = f"({t.type}{(', ' + ', '.join(extra)) if extra else ''})"
-        alias = f" [Aliases:  {', '.join(t.aliases)}]" if t.aliases else ""
+        aliases = normalize_aliases(t.source, t.aliases)
+        alias = f" [Aliases:  {', '.join(aliases)}]" if aliases else ""
         lines.append(f"- {t.source} → {t.target}{tag}{alias}")
         if id(t) in relevant and t.note.strip():
             note = json.dumps({"term": t.source, "note": t.note.strip()}, ensure_ascii=False)

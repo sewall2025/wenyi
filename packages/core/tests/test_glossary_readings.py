@@ -84,7 +84,9 @@ def test_runtime_requests_and_precision_replay_use_resolved_source(tmp_path, sou
 
     def handler(messages, *_):
         if "Task (JSON):" in messages[-1]["content"]:
-            return '{"translations": ["Translated text"]}'
+            # Precision rejects replies without target-language script, so answer in it.
+            text = "Translated text" if cfg.target_lang == "en" else "訳文テキスト"
+            return json.dumps({"translations": [text]}, ensure_ascii=False)
         return json.dumps(
             {
                 "translations": ["Translated text"],

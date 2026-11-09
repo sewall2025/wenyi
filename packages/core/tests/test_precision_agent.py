@@ -56,8 +56,9 @@ def test_synthesis_sees_all_distinct_drafts_source_and_context_without_output_hi
         "polish.body"
     ]
     task = json.loads(client.calls[-1]["messages"][-1]["content"].split("Task (JSON):\n")[1])
-    assert task["drafts"] == [{"0": "甲稿"}, {"0": "乙稿"}, {"0": "丙稿"}]
-    assert "original" in client.calls[-1]["messages"][1]["content"]
+    assert task["segments"] == [{"id": 0, "source": "original", "drafts": ["甲稿", "乙稿", "丙稿"]}]
+    assert task["reference_only"]["context"] == "prior"
+    assert "original" not in client.calls[-1]["messages"][1]["content"]
     assert all(
         message["role"] != "assistant" for call in client.calls for message in call["messages"]
     )
@@ -68,7 +69,7 @@ def test_duplicate_draws_are_not_multiple_votes():
     worker, client = agent({"translations": ["润色稿"]})
     worker.synthesize(inputs("source"), [["初稿"], ["初稿"], ["初稿"]])
     task = json.loads(client.calls[0]["messages"][-1]["content"].split("Task (JSON):\n")[1])
-    assert task["drafts"] == [{"0": "初稿"}]
+    assert task["segments"][0]["drafts"] == ["初稿"]
 
 
 def task_in(messages):
@@ -142,11 +143,21 @@ def test_identical_single_segment_reply_stops_retrying(stage):
     assert worker.failures == {0: "repeated_reply"}
 
 
-def test_extra_segment_is_dropped_without_another_request():
+def test_reply_with_an_unrequested_id_is_rejected_whole_and_halved():
     reply = {"translations": {"0": "甲", "1": "乙", "2": "多余", "-1": "负", "01": "前导零"}}
-    worker, client = agent(reply)
+    worker, client = agent(
+        handler=numbered(["甲", "乙"], lambda ids: reply if len(ids) > 1 else None)
+    )
+    events = []
+    client.set_event_sink(lambda event, **data: events.append((event, data)))
     assert worker.translate(inputs("one", "two")) == ["甲", "乙"]
-    assert len(client.calls) == 1
+    assert [ids_of(call) for call in client.calls] == [[0, 1], [0], [1]]
+    assert events == [
+        (
+            "precision_reply_misaligned",
+            {"operation": "translation.body", "ids": [0, 1], "reason": "unrequested_id"},
+        )
+    ]
 
 
 @pytest.mark.parametrize("stage", ["translate", "synthesize"])
@@ -163,10 +174,10 @@ def test_missing_segment_is_requested_alone_with_the_same_packet(stage):
     else:
         drafts = [["一稿", "二稿", "三稿"], ["一稿", "二改", "三稿"], ["一稿", "二稿", "三稿"]]
         assert worker.synthesize(packet, drafts) == ["甲", "乙", "丙"]
-        # Re-requests carry only the drafts for pending ids, deduplicated by that text.
-        assert task_of(client.calls[1])["drafts"] == [
-            {"0": "一稿", "1": "二稿"},
-            {"0": "一稿", "1": "二改"},
+        # Each re-requested id carries its own source and distinct drafts.
+        assert task_of(client.calls[1])["segments"] == [
+            {"id": 0, "source": "one", "drafts": ["一稿"]},
+            {"id": 1, "source": "two", "drafts": ["二稿", "二改"]},
         ]
     # The entry just before the gap may have absorbed the missing one, so it is redone too.
     assert [ids_of(call) for call in client.calls] == [[0, 1, 2], [0, 1]]
@@ -211,7 +222,7 @@ def test_progress_continues_rounds_on_the_missing_ids_only():
         [1, 2, 3],
         [1, 2],
     ]
-    # Repair rounds quote each id's source; only the first round lists bare ids.
+    # Every round quotes each id's source.
     assert task_of(client.calls[1])["segments"] == [
         {"id": 1, "source": "b"},
         {"id": 2, "source": "c"},
@@ -401,8 +412,10 @@ def test_truncation_halves_without_resending_or_adding_a_budget():
         [3],
     ]
     assert all(call["max_tokens"] is None for call in client.calls)
+    sources = ["one", "two", "three", "four"]
     assert all(
-        '"sources": ["one", "two", "three", "four"]' in call["messages"][1]["content"]
+        [item["source"] for item in task_of(call)["segments"]]
+        == [sources[index] for index in ids_of(call)]
         for call in client.calls
     )
 
@@ -445,7 +458,10 @@ def test_protected_outputs_use_source_in_drafts_and_synthesis(source, generated,
     drafts = [["甲稿", generated], ["乙稿", "changed"], ["丙稿", ""]]
     assert worker.synthesize(packet, drafts) == ["译文", source]
     task = json.loads(client.calls[-1]["messages"][-1]["content"].split("Task (JSON):\n")[1])
-    assert task["drafts"] == [{"0": d, "1": source} for d in ("甲稿", "乙稿", "丙稿")]
+    assert task["segments"] == [
+        {"id": 0, "source": "source", "drafts": ["甲稿", "乙稿", "丙稿"]},
+        {"id": 1, "source": source, "drafts": [source]},
+    ]
     assert drafts == [["甲稿", generated], ["乙稿", "changed"], ["丙稿", ""]]
     assert len(client.calls) == 2
 
@@ -491,8 +507,12 @@ def real_reply(shape):
 
 @pytest.mark.parametrize(
     ("shape", "requested"),
-    [("early_stop", [list(range(36)), list(range(6, 36))]), ("loop", [list(range(36))])]
-    + [("next_source", [list(range(36))])],
+    [("early_stop", [list(range(36)), list(range(6, 36))])]
+    # An entry for id 36 (next_source or a loop) rejects the whole reply, which is halved.
+    + [
+        (shape, [list(range(36)), list(range(18)), list(range(18, 36))])
+        for shape in ("loop", "next_source")
+    ],
 )
 def test_real_failure_shapes_keep_valid_entries_and_repair_only_suspicious_ids(shape, requested):
     answers = [f"第{i}段。" for i in range(36)]
@@ -526,19 +546,22 @@ def test_repairs_quote_their_sources_and_retry_with_feedback(stage):
     else:
         assert worker.synthesize(packet, [["稿"] * 36] * 3) == answers
     tasks = [task_of(call) for call in client.calls]
-    # The whole batch lists bare ids; a repair names each id together with its own source.
-    assert tasks[0]["segments"] == list(range(36))
-    assert [task["segments"] for task in tasks[1:]] == [[{"id": 21, "source": MAYBE}]] * 2
+    # Every request names each id together with its own source.
+    assert [(item["id"], item["source"]) for item in tasks[0]["segments"]] == list(
+        enumerate(REPAIR_SOURCES)
+    )
+    repairs = [[(item["id"], item["source"]) for item in task["segments"]] for task in tasks[1:]]
+    assert repairs == [[(21, MAYBE)]] * 2
     assert all(call["messages"][:2] == client.calls[0]["messages"][:2] for call in client.calls)
     if stage == "synthesize":
-        assert tasks[1]["drafts"] == [{"21": "稿"}]
+        assert tasks[1]["segments"][0]["drafts"] == ["稿"]
     # The lone id's blank reply is quoted back with the restated contract.
     feedback = client.calls[-1]["messages"][-1]["content"]
-    assert "quoted with its id in task.segments" in feedback
+    assert "the source quoted with that id in task.segments" in feedback
     assert '{"translations": {"<id>": "<translation>"}}' in feedback
 
 
-def test_single_segment_synthesis_drops_other_ids():
+def test_single_segment_reply_naming_another_id_is_rejected():
     replies = {
         (0, 1): {"translations": {"0": "甲", "1": ""}},
         (1,): {"translations": {"1": "乙", "0": "多余"}},
@@ -546,8 +569,10 @@ def test_single_segment_synthesis_drops_other_ids():
     worker, client = agent(
         handler=lambda messages, *_: json.dumps(replies[tuple(segment_ids(task_in(messages)))])
     )
-    assert worker.synthesize(inputs("one", "two"), [["甲稿", "乙稿"]] * 3) == ["甲", "乙"]
-    assert [ids_of(call) for call in client.calls] == [[0, 1], [1]]
+    assert worker.synthesize(inputs("one", "two"), [["甲稿", "乙稿"]] * 3) == ["甲", None]
+    # The lone repair answers id 0 too, so nothing of it is used; the same reply ends retries.
+    assert [ids_of(call) for call in client.calls] == [[0, 1], [1], [1]]
+    assert worker.failures == {1: "repeated_reply"}
 
 
 def entries(texts):

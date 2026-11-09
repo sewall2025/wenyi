@@ -11,6 +11,7 @@ from ...agents.analyzer import Analyzer
 from ...agents.synopsis import Synopsizer
 from ...config import Config
 from ...events import ProgressFn
+from ...glossary.admission import active_terms
 from ...i18n.policy.models import content_hash
 from ...models.document import Chapter
 from ...storage.protocol import Storage
@@ -63,7 +64,7 @@ class BookUnderstandingService:
             return ""
 
         analysis = store.load_analysis() or {}
-        terms = sorted(store.all_terms(), key=lambda term: term.source)
+        terms = sorted(active_terms(store.all_terms()), key=lambda term: term.source)
         style = self._analyzer.style_brief(analysis, terms=terms)
         inputs = {
             "language_policy": self._config.language_policy("analysis").task_fingerprint(

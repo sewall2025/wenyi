@@ -111,7 +111,11 @@ export const effective = {
     },
     routes: {},
   },
-  segment: { max_tokens_per_batch: 1800, max_tokens_per_segment: 1200 },
+  segment: {
+    max_tokens_per_batch: 1800,
+    max_segments_per_batch: 6,
+    max_tokens_per_segment: 1200,
+  },
   pipeline: {
     book_understanding: true,
     polish: true,

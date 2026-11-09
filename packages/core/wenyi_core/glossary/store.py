@@ -42,6 +42,8 @@ __all__ = [
     "GlossaryOccurrenceMatcher",
     "GlossaryStore",
     "GlossaryTerm",
+    "match_text",
+    "normalize_aliases",
     "search_term_page",
     "source_matches_text",
     "term_match_sources",
@@ -84,14 +86,53 @@ CREATE TABLE IF NOT EXISTS term_conflicts (
 _RUBY_MARK_RE = re.compile(r"〘[^〙]*〙")
 
 
-def _match_text(text: str) -> str:
-    """Normalize width, compatibility forms and case for glossary matching.
+# Curly and prime quotes fold to ASCII one-for-one, so match spans keep their positions.
+_QUOTE_FOLD = str.maketrans("‘’‚‛′“”„‟″", "'''''\"\"\"\"\"")
+
+
+def match_text(text: str) -> str:
+    """Normalize width, compatibility forms, quotes and case for glossary matching.
     Strip embedded furigana so a reading inserted inside a word does not prevent that word
     from matching. The original ruby markup remains in the source template.
     """
     if "〘" in text:
         text = _RUBY_MARK_RE.sub("", text)
-    return unicodedata.normalize("NFKC", text).casefold()
+    return unicodedata.normalize("NFKC", text).casefold().translate(_QUOTE_FOLD)
+
+
+_match_text = match_text
+
+
+_ALIAS_LIST_SEPARATOR = re.compile(r"[,，、]")
+
+
+def _alias_key(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+
+
+def normalize_aliases(source: str, aliases: list[str]) -> list[str]:
+    """Drop blank, duplicate and source-equal aliases; split rejoined alias lists.
+
+    The glossary prompt joins aliases with ", ", and models copy that list back as one
+    alias. A comma-separated alias is treated as such a list when any part is the source
+    or another alias, and its new parts are kept individually. Order is first-seen.
+    """
+    # ponytail: "any part already known" is a heuristic; a genuine alias like
+    # "Smith, John" next to the alias "John" would be split. Editors can re-add it.
+    plain = [alias for alias in aliases if not _ALIAS_LIST_SEPARATOR.search(alias)]
+    known = {_alias_key(source)} | {_alias_key(alias) for alias in plain}
+    seen = {_alias_key(source)}
+    out: list[str] = []
+    for alias in aliases:
+        parts = [part.strip() for part in _ALIAS_LIST_SEPARATOR.split(alias)]
+        if len(parts) == 1 or not any(_alias_key(part) in known for part in parts):
+            parts = [alias.strip()]
+        for part in parts:
+            key = _alias_key(part)
+            if key and key not in seen:
+                seen.add(key)
+                out.append(part)
+    return out
 
 
 _WORD_BOUNDARY_SCRIPTS = ("LATIN", "GREEK", "CYRILLIC")
@@ -334,7 +375,9 @@ class GlossaryStore:
                         term.reading,
                         term.type,
                         term.gender,
-                        json.dumps(term.aliases, ensure_ascii=False),
+                        json.dumps(
+                            normalize_aliases(term.source, term.aliases), ensure_ascii=False
+                        ),
                         term.first_chapter if term.first_chapter is not None else chapter,
                         term.note,
                         term.status,
@@ -344,16 +387,23 @@ class GlossaryStore:
                 result = "inserted"
             elif existing.target == term.target:
                 # Merging aliases or filling missing fields is not a conflict.
-                merged_aliases = sorted(set(existing.aliases) | set(term.aliases))
+                merged_aliases = sorted(
+                    normalize_aliases(term.source, [*existing.aliases, *term.aliases])
+                )
+                # An active proposal promotes a stored candidate; nothing demotes an entry.
                 self.conn.execute(
                     """UPDATE glossary SET reading=COALESCE(NULLIF(?,''),reading),
                        gender=COALESCE(NULLIF(?,''),gender), aliases=?,
-                       note=COALESCE(NULLIF(?,''),note), updated_at=? WHERE source=?""",
+                       note=COALESCE(NULLIF(?,''),note),
+                       status=CASE WHEN status='candidate' AND ?<>'candidate' THEN 'ok'
+                                   ELSE status END,
+                       updated_at=? WHERE source=?""",
                     (
                         term.reading,
                         term.gender,
                         json.dumps(merged_aliases, ensure_ascii=False),
                         term.note,
+                        term.status,
                         now,
                         term.source,
                     ),
@@ -363,7 +413,9 @@ class GlossaryStore:
                 # Different target: keep the established mapping and record the candidate for human resolution.
                 self._log_conflict(term.source, existing.target, term.target, chapter)
                 self.conn.execute(
-                    "UPDATE glossary SET status='conflict', updated_at=? WHERE source=?",
+                    # A conflicting candidate stays inactive until its frequency is reached.
+                    "UPDATE glossary SET status=CASE WHEN status='candidate' THEN status "
+                    "ELSE 'conflict' END, updated_at=? WHERE source=?",
                     (now, term.source),
                 )
                 result = "conflict"

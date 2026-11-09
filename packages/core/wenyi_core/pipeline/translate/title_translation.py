@@ -9,6 +9,7 @@ from typing import Any
 
 from ...agents import prompts
 from ...agents.title_translator import TitleContextOverflow, TitleOutputError, TitleTranslator
+from ...glossary.admission import active_terms
 from ...glossary.store import GlossaryStore
 from ...models.document import Chapter
 from ...models.glossary import GlossaryTerm
@@ -201,7 +202,7 @@ class TitleTranslationService:
 
         batches = title_batches(plan.pending)
         completed = 0
-        terms = glossary.all_terms()
+        terms = active_terms(glossary.all_terms())
         for batch_index, batch in enumerate(batches):
             titles = [item.source for item in batch]
             try:
@@ -242,10 +243,12 @@ class TitleTranslationService:
     ) -> list[str]:
         """Translate titles, halving oversized requests; an unfittable title stays untranslated.
 
-        A single title is retried with only the glossary entries it cites before it is kept
-        as its source text (returned as ``""``), so context overflow never stops the run.
+        Each request carries only the glossary entries its titles cite. A single title that
+        still cannot fit is kept as its source text (returned as ``""``), so context overflow
+        never stops the run.
         """
-        text = prompts.render_glossary(terms, source_lang=self._translator.src)
+        cited = GlossaryStore.terms_in(terms, "\n".join(titles))
+        text = prompts.render_glossary(cited, source_lang=self._translator.src)
         try:
             return self._translator.translate(titles, text)
         except TitleContextOverflow as overflow:
@@ -263,9 +266,6 @@ class TitleTranslationService:
                 return self._translate_fitting(
                     store, batch_index, titles[:half], terms
                 ) + self._translate_fitting(store, batch_index, titles[half:], terms)
-            cited = GlossaryStore.terms_in(terms, titles[0])
-            if len(cited) < len(terms):
-                return self._translate_fitting(store, batch_index, titles, cited)
             store.log_event(
                 "titles_kept_source",
                 batch=batch_index,

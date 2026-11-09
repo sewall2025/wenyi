@@ -112,6 +112,27 @@ export function WorkflowSettings({
             />
           </div>
           <div>
+            <Label htmlFor="batch-segments">
+              {tr("settings.segmentsPerBatch")}
+            </Label>
+            <Input
+              id="batch-segments"
+              type="number"
+              min={1}
+              value={Number(
+                section(config, "segment").max_segments_per_batch ?? 6,
+              )}
+              onChange={(e) =>
+                onField(
+                  "segment",
+                  "max_segments_per_batch",
+                  orFallback(e.target.value, 6),
+                )
+              }
+              className="mt-2"
+            />
+          </div>
+          <div>
             <Label htmlFor="segment-tokens">
               {tr("settings.tokensPerParagraph")}
             </Label>

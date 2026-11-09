@@ -90,6 +90,7 @@ for (const chinese of [false, true]) {
     await expect(page.getByLabel(chinese ? "PDF 解析后端" : "PDF parser", { exact: true })).toBeVisible();
     await expect(page.getByRole("main").locator("details, summary")).toHaveCount(0);
     await tokens.fill("1400");
+    await page.getByLabel(chinese ? "每批段数上限" : "Segments per batch", { exact: true }).fill("4");
     await page.screenshot({ path: testInfo.outputPath("settings-workflow-expanded.png") });
     await page.getByRole("link", { name: chinese ? "默认模型" : "Default models", exact: true }).click();
     await expect(page.getByLabel(chinese ? "分批翻译章节" : "Translate chapters in batches", { exact: true })).toBeVisible();
@@ -98,6 +99,7 @@ for (const chinese of [false, true]) {
     await expect(yaml).toBeVisible();
     const draft = await yaml.inputValue();
     expect(JSON.parse(draft).segment.max_tokens_per_batch).toBe(1400);
+    expect(JSON.parse(draft).segment.max_segments_per_batch).toBe(4);
     await yaml.fill(`${draft}\n# unsaved draft`);
     await page.getByRole("link", { name: chinese ? "通用" : "General", exact: true }).click();
     await page.getByRole("link", { name: chinese ? "高级" : "Advanced", exact: true }).click();

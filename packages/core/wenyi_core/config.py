@@ -37,12 +37,14 @@ llm:
 segment:
   # Target batch size in tokens (tiktoken cl100k_base).
   max_tokens_per_batch: 1800
+  # Maximum segments per batch; a batch closes at whichever limit is reached first.
+  max_segments_per_batch: 6
   # Split longer paragraphs at sentence boundaries by the same token budget; merge on export.
   max_tokens_per_segment: 1200
 
 # ── Pipeline options (quality and cost)───────────────────────────────────────────
 pipeline:
-  # Body translation and Reviewer requests always use the full glossary.
+  # Body translation and Reviewer requests receive only the glossary entries their source cites.
   review: true # Run final review after whole-book translation; disable with --no-review
   # Additional structural retries for standard translation and precision single-paragraph repair; 0 disables retries.
   align_retry_limit: 2
@@ -99,6 +101,9 @@ class SegmentConfig(BaseModel):
     # segment with no error anywhere (audit Y-3/F-2). max_tokens_per_segment keeps 0 as
     # a valid knob — the splitter then splits every sentence into its own segment.
     max_tokens_per_batch: int = Field(default=1800, gt=0)
+    # Batches close at whichever of the token budget or this segment count is reached first;
+    # long packets make models miscount segment ids.
+    max_segments_per_batch: int = Field(default=6, ge=1)
     max_tokens_per_segment: int = Field(default=1200, ge=0)
 
 

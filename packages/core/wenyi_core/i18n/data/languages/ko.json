@@ -1,6 +1,7 @@
 {
   "label": "Korean",
   "english_name": "Korean",
+  "scripts": ["Hangul"],
   "source_guidance": "Interpret Korean honorifics, omitted subjects and the relationship implied by forms of address. Do not automatically treat honorifics as kinship evidence.",
   "target_guidance": "Use natural Korean. Keep honorific levels, forms of address and narrative style consistent with known relationships, and use correct word spacing.",
   "punctuation_rule": "Use Korean publishing conventions for punctuation, quotes and spaces. Preserve symbol structure, repetition and pairing.",

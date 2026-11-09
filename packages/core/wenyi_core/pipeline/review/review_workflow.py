@@ -16,6 +16,7 @@ from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from ...events import ProgressFn
+from ...glossary.admission import active_terms
 from ...llm.retrying import is_resumable_provider_interrupt
 from ...models.glossary import GlossaryTerm
 from ...review.evidence import BookEvidenceIndex
@@ -45,8 +46,8 @@ class ReviewService:
         )
 
     def session_terms(self, store: Storage) -> list[GlossaryTerm]:
-        """Return the final glossary snapshot used by this review."""
-        return store.all_terms()
+        """Return the final active glossary snapshot (no inactive candidates) for this review."""
+        return active_terms(store.all_terms())
 
     def _review_config_snapshot(self) -> dict[str, Any]:
         """Snapshot review configuration for persisted metadata and reuse checks."""
@@ -58,7 +59,7 @@ class ReviewService:
             "target_lang": self._runtime.config.target_lang,
             "honorific_strategy": self._runtime.config.honorific_strategy,
             "language_policy": self._runtime.config.language_policy("review").fingerprint,
-            "review_glossary_policy": "full",
+            "review_glossary_policy": "cited",
             "review_glossary_reading_source": "ja",
             "review_output_retries": self._runtime.config.pipeline.review_output_retries,
             "review_agent_loop": self._runtime.config.pipeline.review_agent_loop,

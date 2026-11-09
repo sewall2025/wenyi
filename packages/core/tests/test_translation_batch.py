@@ -27,6 +27,28 @@ from tests.pipeline_fixtures import batch_plan as _plan
 from tests.pipeline_fixtures import fake_pipeline_config as _config
 
 
+def test_batches_close_at_whichever_of_tokens_or_segment_count_comes_first():
+    segments = [Segment(index=i, source="word") for i in range(7)]
+    segments[2].target = "done"
+    # The segment cap splits a token budget that would hold everything; completed segments
+    # still form their own batch so resume never retranslates them.
+    assert [[s.index for s in b] for b in resume_batches(segments, 10_000, 3)] == [
+        [0, 1],
+        [2],
+        [3, 4, 5],
+        [6],
+    ]
+    # Here the token budget (one "word" token each) closes batches first.
+    assert [[s.index for s in b] for b in resume_batches(segments, 2, 6)] == [
+        [0, 1],
+        [2],
+        [3],
+        [4, 5],
+        [6],
+    ]
+    assert len(resume_batches(segments, 10_000)) == 3
+
+
 def test_resume_and_review_pack_by_tokens_and_preserve_completed_blank():
     segments = [
         Segment(index=10, source="hello world", target=""),

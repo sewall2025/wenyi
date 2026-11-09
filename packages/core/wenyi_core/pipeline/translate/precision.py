@@ -21,7 +21,7 @@ from .precision_records import PrecisionRecords
 from .translation_batch import BatchPlan, BatchResult
 
 _OPERATIONS = ("translation.body", "polish.body")
-_VERSION = 3
+_VERSION = 4  # 4: every request quotes its sources; reference data follows the segments.
 _DRAFT_IDS = ("T1", "T2", "T3")
 
 

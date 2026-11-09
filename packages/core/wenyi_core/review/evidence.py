@@ -8,7 +8,12 @@ from hashlib import sha256
 from threading import Lock
 from typing import Any
 
-from ..glossary.store import GlossaryTerm, source_matches_text, term_match_sources
+from ..glossary.store import (
+    GlossaryTerm,
+    normalize_aliases,
+    source_matches_text,
+    term_match_sources,
+)
 from ..models.document import Chapter
 from .models import SegmentRef, normalize_value
 
@@ -222,7 +227,9 @@ class BookEvidenceIndex:
             **({"reading": _clip(term.reading, 256)} if self.source_lang == "ja" else {}),
             "type": _clip(term.type, 64),
             "gender": _clip(term.gender, 64),
-            "aliases": [_clip(alias, 256) for alias in term.aliases[:16]],
+            "aliases": [
+                _clip(alias, 256) for alias in normalize_aliases(term.source, term.aliases)[:16]
+            ],
             "first_chapter": term.first_chapter,
             "note": _clip(term.note, 2000),
         }

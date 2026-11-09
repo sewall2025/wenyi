@@ -7,7 +7,7 @@ import os
 import re
 
 from wenyi_core.llm.providers.fake import FakeClient
-from wenyi_core.llm.retrying import ContextLengthExceeded
+from wenyi_core.llm.retrying import ContextLengthExceeded, TruncatedResponseError
 from wenyi_core.models.document import Segment
 from wenyi_core.models.glossary import GlossaryTerm
 from wenyi_core.pipeline.orchestrator import Orchestrator
@@ -73,7 +73,7 @@ def test_review_chunk_over_context_is_bisected_with_chapter_offsets(tmp_path):
     assert resumed.calls == []
 
 
-def test_oversized_singleton_retries_with_cited_terms_then_is_skipped(tmp_path):
+def test_oversized_singleton_with_cited_terms_is_skipped(tmp_path):
     terms = [
         GlossaryTerm(source="源文1", target="原文一"),
         GlossaryTerm(source="远方", target="远方"),
@@ -94,7 +94,7 @@ def test_oversized_singleton_retries_with_cited_terms_then_is_skipped(tmp_path):
     issues, client, debug = _review(handler, segments, terms, tmp_path)
     # Paragraph 1 is skipped; its neighbours keep their chapter-local issue indices.
     assert [issue["index"] for issue in issues] == [0, 2]
-    assert glossary_sizes == [2, 1]  # Full glossary, then only the cited entry.
+    assert glossary_sizes == [1]  # Only the cited entry; there is no smaller retry.
     skipped = [e for e in _events(debug) if e["event"] == "review_chunk_skipped"]
     assert skipped == [
         {
@@ -182,3 +182,54 @@ def test_title_batch_over_context_is_split_and_single_title_keeps_source(tmp_pat
     assert "titles_translation_failed" not in kinds
     assert "titles_batch_split" in kinds
     assert "titles_kept_source" in kinds
+
+
+def test_truncated_review_scan_splits_then_skips_singleton(tmp_path):
+    from wenyi_core.llm.retrying import safe_provider_error
+
+    def handler(messages, tier, json_mode):
+        user = messages[-1]["content"]
+        if _numbered(user) > 1 or "源文1" in user.split("[Paragraph pairs]")[1]:
+            # The router wraps provider truncation without its SDK chain.
+            raise safe_provider_error(
+                TruncatedResponseError("length"), provider="fake", operation="review.scan"
+            )
+        return _review_reply(1)
+
+    segments = [Segment(index=10 + i, source=f"源文{i}", target=f"译文{i}") for i in range(3)]
+    issues, client, debug = _review(handler, segments, [], tmp_path)
+    assert [issue["index"] for issue in issues] == [0, 2]
+    events = _events(debug)
+    splits = [e for e in events if e["event"] == "review_chunk_split"]
+    assert {e["reason"] for e in splits} == {"truncated_response"}
+    skipped = [e for e in events if e["event"] == "review_chunk_skipped"]
+    assert [(e["segment"], e["reason"]) for e in skipped] == [(11, "truncated_response")]
+    # Chunks of 3 and 2, then the singleton once: a truncated singleton is not resent.
+    assert sum("源文1" in c["messages"][-1]["content"] for c in client.calls) == 3
+    assert debug.skipped_segments() == [
+        {"round": None, "chapter": 2, "segment": 11, "reason": "truncated_response"}
+    ]
+
+
+def test_multi_paragraph_review_scan_injects_only_cited_terms(tmp_path):
+    terms = [
+        GlossaryTerm(source="Alice Smith", target="爱丽丝·史密斯", type="person", aliases=["Ally"]),
+        GlossaryTerm(source="Bob", target="鲍勃", type="person"),
+        GlossaryTerm(source="Carol", target="卡罗尔", type="person"),
+        GlossaryTerm(source="Break a leg", target="祝你好运", type="fixed_expression"),
+    ]
+    segments = [
+        Segment(index=0, source="Ally waved.", target="艾丽挥手。"),
+        Segment(index=1, source="Bob nodded.", target="鲍勃点头。"),
+    ]
+    issues, client, _debug = _review(
+        lambda m, t, j: _review_reply(_numbered(m[-1]["content"])), segments, terms, tmp_path
+    )
+    assert [issue["index"] for issue in issues] == [0]
+    scans = [call for call in client.calls if call["operation"] == "review.scan"]
+    assert len(scans) == 1 and _numbered(scans[0]["messages"][-1]["content"]) == 2
+    prompt = "\n".join(message["content"] for message in scans[0]["messages"])
+    assert "Alice Smith → 爱丽丝·史密斯" in prompt  # Cited through its alias.
+    assert "Bob → 鲍勃" in prompt
+    assert "Carol" not in prompt
+    assert "Break a leg" not in prompt

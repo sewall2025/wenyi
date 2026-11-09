@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import json
 import re
-import unicodedata
 from collections import defaultdict
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
 
 from ..errors import WenyiError
 from ..glossary.store import GlossaryStore
+from ..i18n.languages import normalize_language, profile
 from ..ingest.tokens import count_tokens
 from ..llm.base import Messages
 from ..llm.json_parser import JsonParseError, parse_json_loose
@@ -18,6 +18,13 @@ from ..llm.retrying import ContextLengthExceeded, TruncatedResponseError
 from ..models.glossary import GlossaryTerm
 from . import prompts
 from .base import Agent
+from .precision_alignment import (
+    comparable,
+    copies_neighbor_source,
+    drifted_segments,
+    echoes_context,
+    lacks_target_script,
+)
 from .single_segment import (
     SegmentResult,
     ServiceHealth,
@@ -87,11 +94,7 @@ class PrecisionAgent(Agent):
                         if self.config.pipeline.terminology_context
                         else None,
                     ),
-                    "chapter_digest": inputs.chapter_digest,
-                    "context": inputs.context,
-                    "sources": inputs.sources,
                     "annotations": json.loads(prompts.render_annotation_contexts(annotations)),
-                    "next_source": inputs.next_source,
                     "allow_empty_translations": inputs.allow_empty_translations,
                 },
                 ensure_ascii=False,
@@ -135,7 +138,7 @@ class PrecisionAgent(Agent):
             self._solve_plain(inputs, task, operation, drafts, ids, output)
             return output
         # Halves run sequentially, so accepted segments merge in source order.
-        self._solve(inputs, prefix, task, operation, drafts, ids, output, quote_sources=False)
+        self._solve(inputs, prefix, task, operation, drafts, ids, output)
         return output
 
     def _solve(
@@ -147,8 +150,6 @@ class PrecisionAgent(Agent):
         drafts: list[list[str | None]] | None,
         ids: list[int],
         output: list[str | None],
-        *,
-        quote_sources: bool,
     ) -> None:
         """Whole request first; missing ids are re-requested, failed requests split in half."""
         if not ids:
@@ -158,23 +159,19 @@ class PrecisionAgent(Agent):
             if reason is not None:
                 self.failures[ids[0]] = reason
             return
-        messages = self._messages(inputs, prefix, task, drafts, ids, quote_sources)
+        messages = self._messages(inputs, prefix, task, drafts, ids)
         reason = (
             "context_window"
             if self._exceeds_window(inputs, operation, messages, ids)
-            else self._attempt(
-                inputs, prefix, task, operation, drafts, ids, output, 0, quote_sources
-            )
+            else self._attempt(inputs, prefix, task, operation, drafts, ids, output, 0)
         )
         remaining = [index for index in ids if output[index] is None]
         if reason is None:  # Progress: accepted ids merged, re-request only the missing ones.
-            self._solve(
-                inputs, prefix, task, operation, drafts, remaining, output, quote_sources=True
-            )
+            self._solve(inputs, prefix, task, operation, drafts, remaining, output)
             return
         middle = len(remaining) // 2
         for half in (remaining[:middle], remaining[middle:]):
-            self._solve(inputs, prefix, task, operation, drafts, half, output, quote_sources=True)
+            self._solve(inputs, prefix, task, operation, drafts, half, output)
 
     def _solve_plain(
         self,
@@ -343,23 +340,30 @@ class PrecisionAgent(Agent):
         task: str,
         drafts: list[list[str | None]] | None,
         ids: list[int],
-        quote_sources: bool,
     ) -> Messages:
-        """With ``quote_sources`` each requested id carries its source text: models miscount
-        packet positions in repair requests, while the frozen packet prefix stays cacheable.
+        """Every requested id carries its own source (and drafts): models miscount positions.
+
+        Batch references follow the segments as unnumbered reference-only data, so the
+        frozen book prefix stays cacheable and no reference text can be taken for an id.
         """
-        segments: list[object] = list(ids)
-        if quote_sources:
-            segments = [{"id": index, "source": inputs.sources[index]} for index in ids]
-        payload: dict[str, object] = {"segments": segments}
-        if drafts is not None:
-            # Identical text is not additional evidence; drafts are keyed by segment id and a
-            # draft that failed a segment simply omits that id.
-            requested = dict.fromkeys(
-                tuple((str(index), draft[index]) for index in ids if draft[index] is not None)
-                for draft in drafts
-            )
-            payload["drafts"] = [dict(items) for items in requested if items]
+        segments: list[dict[str, object]] = []
+        for index in ids:
+            segment: dict[str, object] = {"id": index, "source": inputs.sources[index]}
+            if drafts is not None:
+                # Identical text is not additional evidence; a failed draft is simply absent.
+                segment["drafts"] = list(
+                    dict.fromkeys(draft[index] for draft in drafts if draft[index] is not None)
+                )
+            segments.append(segment)
+        payload = {
+            "segments": segments,
+            "reference_only": {
+                "note": "Do not number, translate or output these references.",
+                "chapter_digest": inputs.chapter_digest,
+                "context": inputs.context,
+                "next_source": inputs.next_source,
+            },
+        }
         return prefix + [
             {
                 "role": "user",
@@ -400,15 +404,17 @@ class PrecisionAgent(Agent):
         """
         retries = self.config.pipeline.align_retry_limit
         trigger = ""
-        for step, level_prefix, level_drafts in self._shrink_steps(inputs, prefix, drafts, index):
+        for step, level, level_prefix, level_drafts in self._shrink_steps(
+            inputs, prefix, drafts, index
+        ):
             if trigger:
                 self._log_trim(operation, step, trigger, index)
-            messages = self._messages(inputs, level_prefix, task, level_drafts, [index], True)
-            if self._exceeds_window(inputs, operation, messages, [index]):
+            messages = self._messages(level, level_prefix, task, level_drafts, [index])
+            if self._exceeds_window(level, operation, messages, [index]):
                 trigger = "context_window"  # Local estimate: shrink before sending.
                 continue
             reason = self._attempt(
-                inputs, level_prefix, task, operation, level_drafts, [index], output, retries, True
+                level, level_prefix, task, operation, level_drafts, [index], output, retries
             )
             if reason != "context_length":
                 return reason
@@ -424,10 +430,10 @@ class PrecisionAgent(Agent):
         prefix: Messages,
         drafts: list[list[str | None]] | None,
         index: int,
-    ) -> list[tuple[str, Messages, list[list[str | None]] | None]]:
+    ) -> list[tuple[str, PrecisionInputs, Messages, list[list[str | None]] | None]]:
         """Full request first, then each distinct smaller variant; unchanged steps are skipped."""
-        steps: list[tuple[str, Messages, list[list[str | None]] | None]] = [
-            ("full", prefix, drafts)
+        steps: list[tuple[str, PrecisionInputs, Messages, list[list[str | None]] | None]] = [
+            ("full", inputs, prefix, drafts)
         ]
         current = inputs
         for step, smaller in (
@@ -445,12 +451,12 @@ class PrecisionAgent(Agent):
             ),
         ):
             if smaller != current:
-                steps.append((step, self._prefix(smaller), drafts))
+                steps.append((step, smaller, self._prefix(smaller), drafts))
                 current = smaller
         if drafts is not None:
             valid = [draft for draft in drafts if draft[index] is not None]
             if len(valid) > 2:
-                steps.append(("drafts_2", steps[-1][1], valid[:2]))
+                steps.append(("drafts_2", steps[-1][1], steps[-1][2], valid[:2]))
         return steps
 
     def _log_trim(self, operation: str, step: str, trigger: str, index: int) -> None:
@@ -469,13 +475,12 @@ class PrecisionAgent(Agent):
         ids: list[int],
         output: list[str | None],
         retries_remaining: int,
-        quote_sources: bool,
     ) -> str | None:
         """Send one request for ``ids`` with bounded feedback retries; merge accepted segments.
 
         Returns ``None`` once a reply was accepted, otherwise the failure reason.
         """
-        messages = self._messages(inputs, prefix, task, drafts, ids, quote_sources)
+        messages = self._messages(inputs, prefix, task, drafts, ids)
         schema = _translations_schema(ids)
         feedback: list[dict[str, str]] = []
         last_raw: dict[str, str] = {}
@@ -494,6 +499,20 @@ class PrecisionAgent(Agent):
 
             def validate(raw: str) -> list[str | None]:
                 data, duplicate_keys = _parse_reply(raw)
+                scripts = target_scripts(self.tgt)
+                misaligned = misaligned_reply(
+                    inputs.sources, ids, data, context=inputs.context, target_scripts=scripts
+                )
+                if misaligned is not None:
+                    self.client.emit_event(
+                        "precision_reply_misaligned",
+                        operation=operation,
+                        ids=list(ids),
+                        reason=misaligned,
+                    )
+                    raise PrecisionError(
+                        f"Precision reply is misaligned ({misaligned}); no entry was used"
+                    )
                 found = accepted_segments(
                     inputs.sources,
                     ids,
@@ -501,6 +520,8 @@ class PrecisionAgent(Agent):
                     duplicate_keys=duplicate_keys,
                     allow_empty=inputs.allow_empty_translations,
                     copy_is_untranslated=_language(self.src) != _language(self.tgt),
+                    target_scripts=scripts,
+                    next_source=inputs.next_source,
                 )
                 accepted = {
                     index: target for index, target in found.items() if output[index] is None
@@ -556,14 +577,9 @@ class PrecisionAgent(Agent):
                                 "Return only a JSON object like "
                                 '{"translations": {"<id>": "<translation>"}} '
                                 f"with exactly these keys: {keys}, each mapped to the translation "
-                                "string of that requested source segment"
-                                + (
-                                    " (quoted with its id in task.segments)"
-                                    if quote_sources
-                                    else ""
-                                )
-                                + ". Do not merge, split, omit or add segments, and do not "
-                                "translate context or next_source."
+                                "string of the source quoted with that id in task.segments. "
+                                "Do not merge, split, omit or add segments, and do not "
+                                "translate reference_only data."
                             ),
                         },
                     ]
@@ -639,9 +655,14 @@ class PrecisionAgent(Agent):
         )
 
 
-def _comparable(text: str) -> str:
-    """NFKC, casefold and keep letters/digits only, so punctuation and spacing never decide."""
-    return "".join(c for c in unicodedata.normalize("NFKC", text).casefold() if c.isalnum())
+_comparable = comparable
+
+
+def target_scripts(code: str) -> tuple[str, ...]:
+    """Unicode scripts of a target language profile; empty when the language is unknown."""
+    if not normalize_language(code):
+        return ()
+    return tuple(profile(code).get("scripts", ()))
 
 
 def _language(code: str) -> str:
@@ -676,6 +697,8 @@ def accepted_segments(
     duplicate_keys: Collection[str] = (),
     allow_empty: bool = False,
     copy_is_untranslated: bool = True,
+    target_scripts: Collection[str] = (),
+    next_source: str = "",
 ) -> dict[int, str]:
     """Return the requested ids whose reply entry can be trusted; every other id stays pending.
 
@@ -693,9 +716,14 @@ def accepted_segments(
       repetition loop);
     - with ``copy_is_untranslated`` and more than one translatable id requested, text whose
       comparable form equals its source. A single-id request accepts such copies, so names,
-      codes or URLs cannot pause a batch.
+      codes or URLs cannot pause a batch;
+    - text without any letter of ``target_scripts`` that is not its own source
+      (``lacks_target_script``; skipped for same-script pairs);
+    - text equal to the source of the previous or next segment (``copies_neighbor_source``);
+    - runs of ≥2 consecutive entries that match a neighbour's source clearly better than
+      their own (``drifted_segments``).
 
-    Ids whose sources need no translation never affect gaps, repeats or copies.
+    Whole-reply misalignment is judged first by ``misaligned_reply``. Ids whose sources need no translation never affect gaps, repeats or copies.
     """
     items = data.get("translations") if isinstance(data, dict) else data
     translatable = [index for index in ids if Translator._needs_translation(sources[index])]
@@ -737,8 +765,63 @@ def accepted_segments(
     for group in repeats.values():
         if len({_comparable(sources[index]) for index in group}) > 1:
             suspicious.update(group)
+    for index, text in candidates.items():
+        if index in translatable and (
+            lacks_target_script(text, sources[index], target_scripts)
+            or copies_neighbor_source(text, sources, index, next_source)
+        ):
+            suspicious.add(index)
+    suspicious.update(
+        drifted_segments(
+            sources, {i: t for i, t in candidates.items() if i in translatable}, translatable
+        )
+    )
 
     return {index: text for index, text in candidates.items() if index not in suspicious}
+
+
+def misaligned_reply(
+    sources: Sequence[str],
+    ids: Sequence[int],
+    data: object,
+    *,
+    context: str,
+    target_scripts: Collection[str] = (),
+) -> str | None:
+    """Return why a whole reply is shifted against the request, or ``None`` when usable.
+
+    A shifted reply cannot be trusted per entry, so none of its entries is used:
+
+    - ``unrequested_id``: a key that is not a requested id (the model numbered references);
+    - ``context_echo``: the first requested translatable entry restates the last context
+      paragraph (``echoes_context``);
+    - ``missing_target_script``: more than half of the translatable entries have no letter of
+      the target scripts (``lacks_target_script``).
+    """
+    items = data.get("translations") if isinstance(data, dict) else data
+    if not isinstance(items, dict):
+        return None
+    requested = {str(index) for index in ids}
+    if any(key not in requested for key in items):
+        return "unrequested_id"
+    translatable = [index for index in ids if Translator._needs_translation(sources[index])]
+    texts = {
+        index: items[str(index)]
+        for index in translatable
+        if isinstance(items.get(str(index)), str) and items[str(index)].strip()
+    }
+    if (
+        translatable
+        and translatable[0] in texts
+        and echoes_context(texts[translatable[0]], context)
+    ):
+        return "context_echo"
+    foreign = sum(
+        lacks_target_script(text, sources[index], target_scripts) for index, text in texts.items()
+    )
+    if translatable and foreign * 2 > len(translatable):
+        return "missing_target_script"
+    return None
 
 
 def _translations_schema(ids: list[int]) -> dict[str, object]:

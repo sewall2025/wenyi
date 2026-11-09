@@ -18,6 +18,7 @@ from ...agents.terminology import (
     TerminologyKnowledgeError,
     TerminologyReferenceError,
 )
+from ...glossary.admission import active_terms, admit_candidate
 from ...glossary.evidence import BookSourceIndex
 from ...glossary.evidence_models import (
     DiscoveryRejection,
@@ -172,7 +173,7 @@ class TerminologyService:
         Oversized requests first keep only the existing entries the passages cite, then
         halve the passages; a single passage that still cannot fit discovers nothing.
         """
-        full = self.store.all_terms() if existing is None else existing
+        full = active_terms(self.store.all_terms()) if existing is None else existing
         try:
             return self._discover_once(passages, full)
         except TerminologyContextOverflow as overflow:
@@ -398,7 +399,24 @@ class TerminologyService:
         """Discover and admit source-attested people before translation."""
         passages = self.index.for_segments(chapter, segments)
         discovery = self._discover(passages)
-        candidates = [term for term in discovery.terms if term.type == TYPE_PERSON]
+        batch_sources = [segment.source for segment in segments]
+        candidates = []
+        rejected: dict[str, int] = {}
+        for term in discovery.terms:
+            if term.type != TYPE_PERSON:
+                continue
+            reason = admit_candidate(term, batch_sources)
+            if reason is None:
+                candidates.append(term)
+            else:
+                rejected[reason] = rejected.get(reason, 0) + 1
+        if rejected:
+            self.store.log_event(
+                "terminology_candidates_rejected",
+                chapter=chapter,
+                rejected=sum(rejected.values()),
+                reasons=dict(sorted(rejected.items())),
+            )
         occurrences = (
             extractor._first_occurrences(candidates, self.store, history, before)
             if before is not None

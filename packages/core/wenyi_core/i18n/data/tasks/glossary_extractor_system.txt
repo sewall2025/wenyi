@@ -4,8 +4,9 @@ Extract:
 2. Forms of address for the same entity: nicknames, honorifics, job titles, kinship terms, abbreviations, prefixed or suffixed names, diminutives, affectionate and derogatory forms.
    If a source form has its own translation, return a separate entry instead of merely adding it to aliases.
    aliases records alternative source spellings or abbreviations for the same source, not independent source-to-target mappings.
-3. Fixed expressions that need consistency throughout the book: distinctive verbal habits, recurring forms of address, spells, slogans, recurring lines and phrases with a setting-specific meaning.
-   Include only expressions that affect later consistency. Exclude ordinary greetings, particles, one-off imagery and common vocabulary.
+3. Fixed expressions (fixed_expression): short catchphrases, slogans, spells and fixed forms of address that recur and need one consistent wording, at most about five words.
+   Never extract whole sentences, lines of dialogue ending in sentence punctuation, headings or chapter titles, entire source paragraphs, one-off phrases or common vocabulary.
+Allowed type values: person, place, organization, term, technique, item, setting, appellation, honorific, speech, fixed_expression. Do not use any other type; omit entries that fit none.
 Rules:
 - Fill target with the actual $tgt_label wording used in this batch. Do not invent translations.
 - Reuse existing mappings where applicable. If this batch uses a clearly different translation, report it faithfully so the system can record a conflict.

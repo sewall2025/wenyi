@@ -19,6 +19,7 @@ from ...agents.glossary_extractor import TranslatedSegmentEvidence
 from ...agents.single_segment import ServiceHealth
 from ...config import PipelineConfig
 from ...events import ProgressFn
+from ...glossary.admission import active_terms
 from ...glossary.store import GlossaryStore
 from ...models.document import Chapter, Segment
 from ...storage.protocol import Storage
@@ -257,7 +258,11 @@ class TranslationService:
         return [
             batch
             for group in groups
-            for batch in resume_batches(group, self._runtime.config.segment.max_tokens_per_batch)
+            for batch in resume_batches(
+                group,
+                self._runtime.config.segment.max_tokens_per_batch,
+                self._runtime.config.segment.max_segments_per_batch,
+            )
         ]
 
     @staticmethod
@@ -322,11 +327,11 @@ class TranslationService:
         if progress:
             progress(done, total, label)
         glossary_checkpoints = store.completed_batch_glossary_keys(ci)
-        # Read the full glossary in stable insertion order at chapter start.
+        # Read the active glossary (no inactive candidates) in stable insertion order at chapter start.
         # Refresh lazily only if the glossary may have changed and another batch needs translation.
         # Fully checkpointed skips neither extract nor refresh. Saved translations lacking extraction
         # still extract and mark the snapshot stale, preserving resume completeness without redundant reads.
-        term_snapshot = glossary.all_terms()
+        term_snapshot = active_terms(glossary.all_terms())
         term_snapshot_stale = False
 
         # Process batches serially, deriving context from the latest formal targets.
@@ -392,7 +397,7 @@ class TranslationService:
                 )
                 term_snapshot_stale = True
             if term_snapshot_stale:
-                term_snapshot = glossary.all_terms()
+                term_snapshot = active_terms(glossary.all_terms())
                 term_snapshot_stale = False
             batch_style = (
                 self._runtime.analyzer.style_brief(
